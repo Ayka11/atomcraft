@@ -73,18 +73,59 @@ if comp:
     with c1:
         st.subheader(f"Molecular Lattice: {user_input}")
 
-        # ---- Build a PROPERLY newlined XYZ block (mock 8-atom cubic lattice) ----
-        # BUG FIXED: the original used "\\n" (a literal backslash+n), which is
-        # NOT a line break, so the 3Dmol XYZ parser could never split atoms.
-        els = list(comp.keys())
+        # ---- Geometry builder: discrete small molecule vs. extended solid ----
+        # BUG FIXED (accuracy): the previous version ignored the parsed atom
+        # counts (v['n']) and always dropped unique elements onto a fixed
+        # 8-corner cubic grid with 3 A spacing. That's a fine *approximation*
+        # for an extended ionic/network solid (NaCl, TiO2-like), but it is
+        # wrong for a discrete molecule like H2O, and 3 A is far larger than
+        # a real covalent bond (~0.9-1.5 A), so no bonds were ever drawn.
+        counts = {sym: v['n'] for sym, v in comp.items()}
+        total_atoms = sum(counts.values())
+        hub_candidates = [s for s, n in counts.items() if n == 1]
+
         atom_lines = []
-        idx = 0
-        for x in [0, 3]:
-            for y in [0, 3]:
-                for z in [0, 3]:
-                    sym = els[idx % len(els)]
-                    atom_lines.append(f"{sym} {x:.2f} {y:.2f} {z:.2f}")
-                    idx += 1
+
+        if len(comp) == 2 and total_atoms <= 6 and hub_candidates:
+            # --- Discrete small "hub" molecule (AB, AB2, AB3, AB4 style) ---
+            hub = hub_candidates[0]
+            others = [s for s in comp if s != hub for _ in range(counts[s])]
+            bond_len = 1.0  # representative covalent bond length (A)
+
+            atom_lines.append(f"{hub} 0.00 0.00 0.00")
+            n_others = len(others)
+            if n_others == 1:
+                atom_lines.append(f"{others[0]} {bond_len:.2f} 0.00 0.00")
+            elif n_others == 2:
+                half_angle = np.radians(104.5 / 2)  # water-like bent angle
+                dx, dy = bond_len * np.cos(half_angle), bond_len * np.sin(half_angle)
+                atom_lines.append(f"{others[0]} {dx:.2f} {dy:.2f} 0.00")
+                atom_lines.append(f"{others[1]} {dx:.2f} {-dy:.2f} 0.00")
+            elif n_others == 3:
+                for i, sym2 in enumerate(others):
+                    theta = np.radians(120 * i)
+                    x = bond_len * np.cos(theta)
+                    y = bond_len * np.sin(theta)
+                    atom_lines.append(f"{sym2} {x:.2f} {y:.2f} 0.30")
+            else:
+                tetra_dirs = [(1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)]
+                norm = np.sqrt(3)
+                for i, sym2 in enumerate(others[:4]):
+                    vx, vy, vz = tetra_dirs[i]
+                    atom_lines.append(
+                        f"{sym2} {bond_len*vx/norm:.2f} {bond_len*vy/norm:.2f} {bond_len*vz/norm:.2f}"
+                    )
+        else:
+            # --- Extended solid: mock alternating cubic lattice (unchanged approach) ---
+            els = list(comp.keys())
+            idx = 0
+            for x in [0, 3]:
+                for y in [0, 3]:
+                    for z in [0, 3]:
+                        sym = els[idx % len(els)]
+                        atom_lines.append(f"{sym} {x:.2f} {y:.2f} {z:.2f}")
+                        idx += 1
+
         xyz = f"{len(atom_lines)}\nAtomCraft v3.4\n" + "\n".join(atom_lines)
 
         # Slider -> VDW surface "scale". Higher density value = tighter,
