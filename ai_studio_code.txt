@@ -2,7 +2,6 @@ streamlit
 pandas
 numpy
 plotly
-mp-api
 mendeleev
 stmol
 py3Dmol
