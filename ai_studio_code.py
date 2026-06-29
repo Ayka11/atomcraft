@@ -3,17 +3,18 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import re
+import json
 import streamlit.components.v1 as components
 
 # ==========================================
 # 1. SCIENTIFIC DATA (Zero-Dependency)
 # ==========================================
 # [Pauling electronegativity (chi), covalent radius (Angstrom), Jmol/CPK color]
-# Coverage: H -> Pu. Anything beyond this (or a typo) falls back to a
-# neutral heuristic placeholder in get_el_data() instead of crashing —
-# this IS the documented "first-principles fallback" from the original spec.
-# PRODUCTION NOTE: swap this static table for a live pymatgen/mendeleev
-# lookup if exact, citation-grade constants are ever required.
+# Coverage: H -> Pu. Anything beyond this falls back to a neutral
+# heuristic placeholder in get_el_data() instead of crashing — this IS the
+# documented "first-principles fallback" architecture.
+# PRODUCTION NOTE: swap ELEMENTS/GROUP_BLOCK for a live pymatgen/mendeleev
+# lookup if citation-grade constants are ever required.
 ELEMENTS = {
     "H": [2.20, 0.37, "#FFFFFF"], "He": [0.00, 0.32, "#D9FFFF"],
     "Li": [0.98, 1.34, "#CC80FF"], "Be": [1.57, 0.90, "#C2FF00"],
@@ -63,19 +64,74 @@ ELEMENTS = {
     "Pa": [1.50, 2.00, "#00A1FF"], "U": [1.38, 1.96, "#008FFF"],
     "Np": [1.36, 1.90, "#0080FF"], "Pu": [1.28, 1.87, "#006BFF"],
 }
-KNOWN_SYMBOLS = set(ELEMENTS.keys())
+
+# Group (1-18, or 'Lanthanide'/'Actinide' for the f-block rows) and block
+# ('s'/'p'/'d'/'f') — used to infer d-/f-orbital presence per the spec.
+GROUP_BLOCK = {
+    "H": (1, "s"), "He": (18, "s"),
+    "Li": (1, "s"), "Be": (2, "s"), "B": (13, "p"), "C": (14, "p"), "N": (15, "p"),
+    "O": (16, "p"), "F": (17, "p"), "Ne": (18, "p"),
+    "Na": (1, "s"), "Mg": (2, "s"), "Al": (13, "p"), "Si": (14, "p"), "P": (15, "p"),
+    "S": (16, "p"), "Cl": (17, "p"), "Ar": (18, "p"),
+    "K": (1, "s"), "Ca": (2, "s"), "Sc": (3, "d"), "Ti": (4, "d"), "V": (5, "d"),
+    "Cr": (6, "d"), "Mn": (7, "d"), "Fe": (8, "d"), "Co": (9, "d"), "Ni": (10, "d"),
+    "Cu": (11, "d"), "Zn": (12, "d"), "Ga": (13, "p"), "Ge": (14, "p"), "As": (15, "p"),
+    "Se": (16, "p"), "Br": (17, "p"), "Kr": (18, "p"),
+    "Rb": (1, "s"), "Sr": (2, "s"), "Y": (3, "d"), "Zr": (4, "d"), "Nb": (5, "d"),
+    "Mo": (6, "d"), "Tc": (7, "d"), "Ru": (8, "d"), "Rh": (9, "d"), "Pd": (10, "d"),
+    "Ag": (11, "d"), "Cd": (12, "d"), "In": (13, "p"), "Sn": (14, "p"), "Sb": (15, "p"),
+    "Te": (16, "p"), "I": (17, "p"), "Xe": (18, "p"),
+    "Cs": (1, "s"), "Ba": (2, "s"),
+    "La": ("Lanthanide", "f"), "Ce": ("Lanthanide", "f"), "Pr": ("Lanthanide", "f"),
+    "Nd": ("Lanthanide", "f"), "Pm": ("Lanthanide", "f"), "Sm": ("Lanthanide", "f"),
+    "Eu": ("Lanthanide", "f"), "Gd": ("Lanthanide", "f"), "Tb": ("Lanthanide", "f"),
+    "Dy": ("Lanthanide", "f"), "Ho": ("Lanthanide", "f"), "Er": ("Lanthanide", "f"),
+    "Tm": ("Lanthanide", "f"), "Yb": ("Lanthanide", "f"), "Lu": ("Lanthanide", "f"),
+    "Hf": (4, "d"), "Ta": (5, "d"), "W": (6, "d"), "Re": (7, "d"), "Os": (8, "d"),
+    "Ir": (9, "d"), "Pt": (10, "d"), "Au": (11, "d"), "Hg": (12, "d"), "Tl": (13, "p"),
+    "Pb": (14, "p"), "Bi": (15, "p"), "Po": (16, "p"), "At": (17, "p"), "Rn": (18, "p"),
+    "Fr": (1, "s"), "Ra": (2, "s"),
+    "Ac": ("Actinide", "f"), "Th": ("Actinide", "f"), "Pa": ("Actinide", "f"),
+    "U": ("Actinide", "f"), "Np": ("Actinide", "f"), "Pu": ("Actinide", "f"),
+}
+
+
+def _valence_from(group, block):
+    """Valence-electron heuristic. s/p-block follow the standard group-number
+    rule. d-block uses the group number itself as a simplified proxy for
+    total (s+d) valence electrons. f-block defaults to 3 — the common +3
+    oxidation state shared by most lanthanides/actinides — since exact
+    valence counting for f-block elements is genuinely context-dependent."""
+    if block == "s":
+        return group if isinstance(group, int) else 2
+    if block == "p":
+        return (group - 10) if isinstance(group, int) else 4
+    if block == "d":
+        return group if isinstance(group, int) else 6
+    return 3  # f-block
+
+
+ELEMENT_INFO = {}
+for _sym, (_chi, _rad, _col) in ELEMENTS.items():
+    _group, _block = GROUP_BLOCK.get(_sym, (14, "p"))
+    ELEMENT_INFO[_sym] = {
+        "chi": _chi, "radius": _rad, "color": _col,
+        "group": _group, "block": _block,
+        "valence": _valence_from(_group, _block),
+    }
+_FALLBACK = {"chi": 2.0, "radius": 1.0, "color": "#757575",
+             "group": 14, "block": "p", "valence": 4}
+KNOWN_SYMBOLS = set(ELEMENT_INFO.keys())
 
 
 @st.cache_data
 def get_el_data(symbol):
     s = symbol[0].upper() + symbol[1:].lower() if len(symbol) > 1 else symbol.upper()
-    return ELEMENTS.get(s, [2.0, 1.0, "#757575"])  # generic fallback, never crashes
+    return ELEMENT_INFO.get(s, _FALLBACK)
 
 
+# ---------- Formula parsing (parentheses, hydrates, ambiguous casing) ----------
 def _greedy_match_symbol(text, i):
-    """Case-insensitive longest-match lookup against KNOWN_SYMBOLS — used
-    only as a fallback recovery step (see parse_formula) for sloppily-cased
-    input like 'NACL' or 'tio2' where letter boundaries are otherwise lost."""
     if i + 1 < len(text):
         two = text[i:i + 2]
         cand2 = two[0].upper() + two[1].lower()
@@ -85,14 +141,10 @@ def _greedy_match_symbol(text, i):
 
 
 def _strict_single_letter(text, i):
-    """Treat every alpha character as its own one-letter symbol candidate."""
     return text[i].upper(), i + 1
 
 
 def _mixed_case_match(text, i):
-    """Standard IUPAC-style matching: an uppercase letter optionally
-    followed by ONE lowercase letter (only valid when input already has
-    correct, unambiguous casing)."""
     m = re.match(r'[A-Za-z][a-z]?', text[i:])
     raw = m.group(0)
     sym = raw[0].upper() + raw[1:].lower()
@@ -100,8 +152,6 @@ def _mixed_case_match(text, i):
 
 
 def _parse_segment(formula, matcher):
-    """Stack-based parser: handles nested (parentheses)/[brackets] with
-    trailing multipliers (e.g. Fe2(SO4)3) using the given symbol matcher."""
     stack = [{}]
     i, n = 0, len(formula)
     while i < n:
@@ -120,7 +170,6 @@ def _parse_segment(formula, matcher):
                 top = stack.pop()
                 for el, cnt in top.items():
                     stack[-1][el] = stack[-1].get(el, 0) + cnt * mult
-            # a stray ')' with no matching '(' is ignored gracefully
         elif c.isalpha():
             sym, i = matcher(formula, i)
             j = i
@@ -130,8 +179,8 @@ def _parse_segment(formula, matcher):
             i = j
             stack[-1][sym] = stack[-1].get(sym, 0) + cnt
         else:
-            i += 1  # skip spaces, charges, stray punctuation
-    while len(stack) > 1:  # gracefully merge any unbalanced groups
+            i += 1
+    while len(stack) > 1:
         top = stack.pop()
         for el, cnt in top.items():
             stack[-1][el] = stack[-1].get(el, 0) + cnt
@@ -139,23 +188,16 @@ def _parse_segment(formula, matcher):
 
 
 def parse_formula(formula):
-    """Robust formula parser:
-    - Supports nested parentheses/multipliers: Ca(OH)2, Fe2(SO4)3
-    - Supports hydrate dot-notation: CuSO4.5H2O, CuSO4*5H2O, CuSO4(middle-dot)5H2O
-    - Tolerant of ambiguous casing: 'NaCl' / 'nacl' / 'NACL' all resolve to
-      Na+Cl. Properly-cased input (mixed upper/lower) is always trusted as-is
-      (e.g. 'CO' stays Carbon+Oxygen, never guessed as Cobalt) since real
-      casing is the only thing that can correctly disambiguate chemistry
-      notation — when it's missing, this is a best-effort recovery, not a
-      certainty, and there is no way to fully resolve cases like ambiguous
-      'CO' vs 'Co' typed without any case information at all.
-    """
+    """Supports nested parentheses/multipliers (Fe2(SO4)3), hydrate
+    dot-notation (CuSO4.5H2O), and ambiguous casing ('NaCl'/'nacl'/'NACL'
+    all resolve correctly; properly-cased input like 'CO' is always trusted
+    as Carbon+Oxygen rather than guessed as Cobalt)."""
     formula = formula.strip()
     has_upper = any(c.isupper() for c in formula)
     has_lower = any(c.islower() for c in formula)
     mixed_case = has_upper and has_lower
 
-    segments = re.split(r'[.\u00B7*]', formula)  # hydrate separators: . · *
+    segments = re.split(r'[.\u00B7*]', formula)
     combined = {}
     for seg in segments:
         seg = seg.strip()
@@ -168,9 +210,6 @@ def parse_formula(formula):
         if mixed_case:
             seg_counts = _parse_segment(rest, _mixed_case_match)
         else:
-            # Ambiguous casing: trust single-letter-per-symbol first; only
-            # fall back to greedy multi-letter recovery if that produced an
-            # element symbol that doesn't actually exist (e.g. 'A', 'L').
             strict_counts = _parse_segment(rest, _strict_single_letter)
             if all(sym in KNOWN_SYMBOLS for sym in strict_counts):
                 seg_counts = strict_counts
@@ -185,23 +224,135 @@ def parse_formula(formula):
         if not sym or count <= 0:
             continue
         d = get_el_data(sym)
-        parsed[sym] = {"n": count, "chi": d[0], "rad": d[1], "col": d[2]}
+        parsed[sym] = {
+            "n": count, "chi": d["chi"], "rad": d["radius"], "col": d["color"],
+            "group": d["group"], "block": d["block"], "valence": d["valence"],
+        }
     return parsed
 
+
 # ==========================================
-# 2. APP CONFIGURATION
+# 2 & 3. PREDICTIVE BRIDGE LOGIC (van Arkel–Ketelaar + macro properties)
 # ==========================================
-st.set_page_config(page_title="AtomCraft Pro v3.4", layout="wide")
-st.markdown("<style>.main { background: #0d1117; color: white; }</style>", unsafe_allow_html=True)
+CATEGORY_COLORS = {
+    "Ionic": "#ff4b4b", "Metallic": "#58a6ff",
+    "Covalent Network": "#3fb950", "Polar Covalent": "#f0883e",
+}
+
+# Elements conventionally regarded as metals (used to detect pure metals and
+# alloys whose Pauling chi happens to be high — e.g. W=2.36, Pt=2.28, Au=2.54
+# — which a raw "mean chi < threshold" rule would wrongly call non-metallic).
+METAL_SYMBOLS = {
+    "Li", "Na", "K", "Rb", "Cs", "Fr", "Be", "Mg", "Ca", "Sr", "Ba", "Ra",
+    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+    "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd",
+    "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
+    "Al", "Ga", "In", "Sn", "Tl", "Pb", "Bi", "Po",
+    "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu",
+    "Ac", "Th", "Pa", "U", "Np", "Pu",
+}
+
+
+def van_arkel_analysis(mean_chi, delta_chi, symbols=None):
+    """Places the compound on a (Mean χ, Δχ) van Arkel–Ketelaar triangle and
+    derives continuous Metallic/Covalent/Ionic character percentages via
+    inverse-distance weighting to three archetypal corners (purely
+    descriptive — shown in the UI as a continuous breakdown).
+
+    The discrete category label uses calibrated rules rather than a raw
+    argmax of those percentages: raw electronegativity alone misclassifies
+    high-chi metals (W=2.36, Pt=2.28, Au=2.54) as covalent, since chi
+    doesn't cleanly separate "metal" from "nonmetal" in the d-block — so
+    pure-metal/alloy detection instead checks actual periodic-table
+    metal membership (METAL_SYMBOLS) for small Δχ before falling back to
+    the standard ionic/covalent chi-based rules."""
+    metallic_pt, covalent_pt, ionic_pt = (1.0, 0.0), (2.5, 0.0), (1.8, 3.3)
+    pt = (mean_chi, delta_chi)
+
+    def dist(a, b):
+        return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5 + 1e-6
+
+    d_m, d_c, d_i = dist(pt, metallic_pt), dist(pt, covalent_pt), dist(pt, ionic_pt)
+    inv = np.array([1 / d_m, 1 / d_c, 1 / d_i])
+    pct = 100 * inv / inv.sum()
+    metallic_pct, covalent_pct, ionic_pct = pct.tolist()
+
+    ionic_character = 100 * (1 - np.exp(-0.25 * delta_chi ** 2))  # Pauling-style, continuous
+    is_all_metal = bool(symbols) and all(s in METAL_SYMBOLS for s in symbols)
+
+    if is_all_metal and delta_chi < 1.5:
+        category = "Metallic"
+    elif ionic_character > 50:
+        category = "Ionic"
+    elif delta_chi < 0.7:
+        category = "Covalent Network"
+    else:
+        category = "Polar Covalent"
+
+    return {
+        "metallic_pct": metallic_pct, "covalent_pct": covalent_pct, "ionic_pct": ionic_pct,
+        "ionic_character": ionic_character, "category": category, "point": pt,
+        "corners": {"Metallic": metallic_pt, "Covalent": covalent_pt, "Ionic": ionic_pt},
+    }
+
+
+def estimate_band_gap(category, delta_chi):
+    if category == "Metallic":
+        return 0.0
+    return max(0.0, (delta_chi * 2.1) - 0.4)
+
+
+def estimate_mechanical(analysis, avg_rad):
+    """Heuristic 0-100 engineering-trait scores. NOT a DFT/empirical
+    mechanical model — swap for a real materials-informatics pipeline
+    (e.g. trained on Materials Project elastic-tensor data) in production."""
+    covalent_pct, ionic_pct, metallic_pct = (
+        analysis["covalent_pct"], analysis["ionic_pct"], analysis["metallic_pct"]
+    )
+    size_factor = max(0.0, min(1.0, (2.2 - avg_rad) / 1.8))  # smaller atoms -> harder
+    hardness = max(0.0, min(100.0, covalent_pct * 0.55 + size_factor * 100 * 0.45))
+    ductility = max(0.0, min(100.0, metallic_pct))
+    network_weight = 1.0 if analysis["category"] == "Covalent Network" else 0.3
+    brittleness = max(0.0, min(100.0,
+        ionic_pct * 0.6 + covalent_pct * 0.4 * network_weight - metallic_pct * 0.3))
+    return {"Hardness": hardness, "Ductility": ductility, "Brittleness": brittleness}
+
+
+def estimate_melting(category, is_molecule):
+    if is_molecule:
+        return "Low", "Discrete molecule — weak intermolecular forces dominate despite strong internal covalent bonds (e.g. ice, dry ice)."
+    if category == "Covalent Network":
+        return "Extremely High", "Continuous covalent lattice — every atom is part of one bonded network (e.g. diamond, SiC, TiO2)."
+    if category == "Ionic":
+        return "High", "Strong electrostatic lattice energy holds the ionic crystal together."
+    if category == "Metallic":
+        return "Moderate–High", "Delocalized 'electron sea' bonding; varies widely by specific metal."
+    return "Moderate", "Polar covalent network — intermediate bond strength."
+
+
+# ==========================================
+# 4. APP CONFIGURATION & THEME
+# ==========================================
+st.set_page_config(page_title="AtomCraft v4.0", layout="wide")
+st.markdown("""
+<style>
+.main { background: linear-gradient(180deg, #0a0e14 0%, #0d1117 100%); color: #e6edf3; }
+section[data-testid="stSidebar"] { background: #0d1117; border-right: 1px solid #21262d; }
+div[data-testid="stMetricValue"] { font-size: 1.5rem; }
+div[data-testid="stMetric"] { background: #11161d; border: 1px solid #21262d; border-radius: 10px; padding: 10px; }
+.stTabs [data-baseweb="tab-list"] { gap: 4px; }
+</style>
+""", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🔬 AtomCraft v3.4")
-    user_input = st.text_input("Chemical Formula", value="NaCl")
+    st.title("🔬 AtomCraft v4.0")
+    st.caption("Universal Nano-Material Property Designer")
+    user_input = st.text_input("Chemical Formula", value="AuCl")
     iso_val = st.slider("Electron Cloud Density", 0.01, 0.50, 0.12)
-    st.info("System: Manual WebGL Init (Fixed)")
+    st.info("Universal Prediction Mode — heuristic van Arkel–Ketelaar engine\n\n(element-accurate sphere sizing)")
 
 # ==========================================
-# 3. COMPUTATION
+# 5. COMPUTATION
 # ==========================================
 comp = parse_formula(user_input)
 
@@ -211,80 +362,70 @@ if comp:
     all_chi = [v['chi'] for v in v_list]
     delta_chi = max(all_chi) - min(all_chi)
     avg_chi = sum(v['chi'] * v['n'] for v in v_list) / total_n
+    avg_rad = sum(v['rad'] * v['n'] for v in v_list) / total_n
 
-    if delta_chi > 1.7:
-        b_type, b_col = "Ionic", "#ff4b4b"
-    elif avg_chi < 1.9 and delta_chi < 1.0:
-        b_type, b_col = "Metallic", "#58a6ff"
-    else:
-        b_type, b_col = "Covalent", "#3fb950"
+    analysis = van_arkel_analysis(avg_chi, delta_chi, symbols=list(comp.keys()))
+    b_type = analysis["category"]
+    b_col = CATEGORY_COLORS[b_type]
+
+    counts = {sym: v['n'] for sym, v in comp.items()}
+    total_atoms = sum(counts.values())
+    hub_candidates = [s for s, n in counts.items() if n == 1]
+
+    def hub_score(s):
+        return (s == "H") + (s == "O") * 0.5
+    hub_candidates_sorted = sorted(hub_candidates, key=hub_score)
+    # BUG FIXED: a single-element formula (e.g. "Cu", "C") trivially has one
+    # "hub candidate" with zero ligands, which used to render as one lonely
+    # floating atom instead of falling through to the lattice branch.
+    is_molecule = bool(hub_candidates_sorted) and total_atoms <= 12 and len(comp) >= 2
+
+    bg = estimate_band_gap(b_type, delta_chi)
+    mech = estimate_mechanical(analysis, avg_rad)
+    # BUG FIXED: melting estimate no longer trusts the geometry-only
+    # is_molecule flag whenever the bonding analysis says Ionic/Metallic/
+    # Covalent Network — those are extended-structure categories by
+    # definition (e.g. GaAs and MoS2 trivially satisfy the "hub + few
+    # ligands" geometry pattern but are real covalent-network semiconductors,
+    # not discrete weakly-bound molecules; they were wrongly coming back as
+    # "Low" melting). The molecular/weak-intermolecular framing now only
+    # applies to "Polar Covalent" — the one category that actually covers
+    # discrete small molecules like H2O, CO2, NH3, CO in this model.
+    melt_is_molecule = is_molecule and b_type == "Polar Covalent"
+    melt_label, melt_desc = estimate_melting(b_type, melt_is_molecule)
 
     c1, c2 = st.columns([2, 1])
 
+    # ======================= CENTER: 3D LATTICE =======================
     with c1:
         st.subheader(f"Molecular Lattice: {user_input}")
 
-        # ---- Geometry builder: discrete small molecule vs. extended solid ----
-        # BUG FIXED (accuracy): the previous version ignored the parsed atom
-        # counts (v['n']) and always dropped unique elements onto a fixed
-        # 8-corner cubic grid with 3 A spacing. That's a fine *approximation*
-        # for an extended ionic/network solid (NaCl, TiO2-like), but it is
-        # wrong for a discrete molecule like H2O, and 3 A is far larger than
-        # a real covalent bond (~0.9-1.5 A), so no bonds were ever drawn.
-        counts = {sym: v['n'] for sym, v in comp.items()}
-        total_atoms = sum(counts.values())
-        hub_candidates = [s for s, n in counts.items() if n == 1]
-
         atom_lines = []
-
-        # Hub priority: real "central" atoms in chemistry are virtually never
-        # H, and rarely O — prefer other single-count elements as the hub
-        # (e.g. C in H2CO4) before falling back to O, then H.
-        def hub_score(s):
-            return (s == "H") + (s == "O") * 0.5
-        hub_candidates_sorted = sorted(hub_candidates, key=hub_score)
-
-        if hub_candidates_sorted and total_atoms <= 12:
-            # --- Discrete small "hub" molecule: hub atom + ALL remaining atoms,
-            # respecting their real counts (works for any number of unique
-            # elements, e.g. H2, C1, O4 in H2CO4 -> 6 atoms around the hub) ---
+        if is_molecule:
             hub = hub_candidates_sorted[0]
             expanded = [s for s, n in counts.items() for _ in range(n)]
             others = expanded.copy()
             others.remove(hub)
-            bond_len = 1.1  # representative covalent bond length (A)
+            bond_len = 1.1
 
             atom_lines.append(f"{hub} 0.00 0.00 0.00")
             n_others = len(others)
             if n_others == 1:
                 atom_lines.append(f"{others[0]} {bond_len:.2f} 0.00 0.00")
             elif n_others == 2:
-                half_angle = np.radians(104.5 / 2)  # water-like bent angle
+                half_angle = np.radians(104.5 / 2)
                 dx, dy = bond_len * np.cos(half_angle), bond_len * np.sin(half_angle)
                 atom_lines.append(f"{others[0]} {dx:.2f} {dy:.2f} 0.00")
                 atom_lines.append(f"{others[1]} {dx:.2f} {-dy:.2f} 0.00")
             else:
-                # Generic even spread on a sphere around the hub for 3+
-                # surrounding atoms (Fibonacci sphere) so every single atom in
-                # the formula gets a position — none are silently dropped.
                 golden_angle = np.pi * (3 - np.sqrt(5))
                 for i, sym2 in enumerate(others):
                     y = 1 - (i / float(n_others - 1)) * 2 if n_others > 1 else 0
                     r = np.sqrt(max(0.0, 1 - y * y))
                     theta = golden_angle * i
                     x, z = np.cos(theta) * r, np.sin(theta) * r
-                    atom_lines.append(
-                        f"{sym2} {bond_len*x:.2f} {bond_len*y:.2f} {bond_len*z:.2f}"
-                    )
+                    atom_lines.append(f"{sym2} {bond_len*x:.2f} {bond_len*y:.2f} {bond_len*z:.2f}")
         else:
-            # --- Extended solid: cubic lattice SIZED to the real atom count ---
-            # BUG FIXED (accuracy): this used to be hard-capped at 8 fixed grid
-            # corners and cycled only the *unique* symbols modulo 8, so any
-            # formula with >2 unique elements (or counts that don't divide
-            # evenly into 8) rendered the wrong number of each atom type.
-            # Now every atom the formula actually specifies gets placed, in a
-            # round-robin (interleaved) order so the lattice still alternates
-            # visually rather than clumping same-type atoms together.
             buckets = {sym: [sym] * n for sym, n in counts.items()}
             interleaved = []
             while any(buckets.values()):
@@ -292,9 +433,6 @@ if comp:
                     if buckets[sym]:
                         interleaved.append(buckets[sym].pop(0))
 
-            # Safety cap: render at most MAX_RENDER_ATOMS spheres so an
-            # extreme/typo'd formula (e.g. a stray "H500") can't stall the
-            # WebGL viewer. The Analysis panel still uses the FULL real counts.
             MAX_RENDER_ATOMS = 60
             render_n = min(total_atoms, MAX_RENDER_ATOMS)
             if total_atoms > MAX_RENDER_ATOMS:
@@ -318,12 +456,20 @@ if comp:
             for sym, (x, y, z) in zip(interleaved, grid_positions):
                 atom_lines.append(f"{sym} {x:.2f} {y:.2f} {z:.2f}")
 
-        xyz = f"{len(atom_lines)}\nAtomCraft v3.4\n" + "\n".join(atom_lines)
+        xyz = f"{len(atom_lines)}\nAtomCraft v4.0\n" + "\n".join(atom_lines)
 
-        # Slider -> VDW surface "scale". Higher density value = tighter,
-        # more contracted envelope (mimics a higher iso-value cutoff).
-        # Swap this whole block for a real isosurface built from a CIF /
-        # volumetric DFT grid once Live API Mode supplies actual density data.
+        # BUG FIXED (sizing accuracy): the previous version used ONE fixed
+        # sphere radius for every element, so e.g. Au and Cl rendered
+        # identically sized despite real covalent radii of 1.44 vs 0.99 A.
+        # Each element now gets its own scaled sphere radius (scale=0.45,
+        # clamped to keep tiny/huge atoms visually sane in a ball-and-stick
+        # view) so relative atomic size is genuinely informative.
+        radius_map = {
+            sym: round(max(0.28, min(0.85, v['rad'] * 0.45)), 3)
+            for sym, v in comp.items()
+        }
+        radius_map_json = json.dumps(radius_map)
+
         surf_scale = max(0.3, 1.6 - (iso_val * 3.0))
 
         html_3d = f"""
@@ -337,15 +483,16 @@ if comp:
                 let xyzData = `{xyz}`;
                 viewer.addModel(xyzData, "xyz");
 
-                viewer.setStyle({{}}, {{
-                    sphere: {{ radius: 0.55, colorscheme: 'Jmol' }},
-                    stick: {{ radius: 0.12, color: 'grey' }}
+                viewer.setStyle({{}}, {{ stick: {{ radius: 0.12, color: 'grey' }} }});
+
+                let radiusMap = {radius_map_json};
+                Object.keys(radiusMap).forEach(function(sym) {{
+                    viewer.setStyle({{elem: sym}}, {{
+                        sphere: {{ radius: radiusMap[sym], colorscheme: 'Jmol' }},
+                        stick: {{ radius: 0.12, color: 'grey' }}
+                    }});
                 }});
 
-                // BUG FIXED: addIsosurface(null, ...) is invalid — it needs real
-                // volumetric grid data and throws on null, which silently killed
-                // the rest of the render. A VDW surface is the correct stand-in
-                // for an "electron cloud" envelope when no DFT grid exists.
                 viewer.addSurface($3Dmol.SurfaceType.VDW, {{
                     opacity: 0.35,
                     color: '{b_col}',
@@ -363,18 +510,102 @@ if comp:
         """
         components.html(html_3d, height=520)
 
+    # ======================= RIGHT: TELEMETRY =======================
     with c2:
         st.subheader("Analysis")
-        st.metric("Bonding Type", b_type)
+        m1, m2 = st.columns(2)
+        m1.metric("Mean χ", f"{avg_chi:.2f}")
+        m2.metric("Δχ", f"{delta_chi:.2f}")
+        m3, m4 = st.columns(2)
+        m3.metric("Avg Radius", f"{avg_rad:.2f} Å")
+        m4.metric("Bond Type", b_type)
 
-        bg = max(0, (delta_chi * 2.1) - 0.4) if b_type != "Metallic" else 0
-        fig = go.Figure(go.Indicator(
-            mode="gauge+number", value=bg,
-            title={'text': "Band Gap (eV)"},
-            gauge={'axis': {'range': [0, 10]}, 'bar': {'color': b_col}}
-        ))
-        fig.update_layout(height=280, paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"}, margin=dict(t=50, b=20))
-        st.plotly_chart(fig, use_container_width=True)
-        st.table(pd.DataFrame([{"Sym": k, "χ": v['chi']} for k, v in comp.items()]))
+        tab_bond, tab_band, tab_mech, tab_comp = st.tabs(
+            ["Bonding", "Band Structure", "Mechanical", "Composition"]
+        )
+
+        with tab_bond:
+            corners = analysis["corners"]
+            xs = [corners["Metallic"][0], corners["Covalent"][0], corners["Ionic"][0], corners["Metallic"][0]]
+            ys = [corners["Metallic"][1], corners["Covalent"][1], corners["Ionic"][1], corners["Metallic"][1]]
+            fig_tri = go.Figure()
+            fig_tri.add_trace(go.Scatter(x=xs, y=ys, mode="lines",
+                                          line=dict(color="#444", width=1), showlegend=False))
+            for label, (cx, cy) in corners.items():
+                fig_tri.add_trace(go.Scatter(x=[cx], y=[cy], mode="markers+text", text=[label],
+                                              textposition="bottom center", textfont=dict(color="#888"),
+                                              marker=dict(size=6, color="#666"), showlegend=False))
+            fig_tri.add_trace(go.Scatter(x=[avg_chi], y=[delta_chi], mode="markers",
+                                          marker=dict(size=16, color=b_col, line=dict(width=2, color="white")),
+                                          showlegend=False))
+            fig_tri.update_layout(
+                height=280, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font={"color": "white"}, margin=dict(t=20, b=20, l=20, r=20),
+                xaxis=dict(title="Mean χ", range=[0.5, 3.2], gridcolor="#21262d"),
+                yaxis=dict(title="Δχ (ionic axis)", range=[-0.3, 3.6], gridcolor="#21262d"),
+            )
+            st.plotly_chart(fig_tri, use_container_width=True)
+            st.caption(
+                f"Metallic {analysis['metallic_pct']:.0f}% · Covalent {analysis['covalent_pct']:.0f}% · "
+                f"Ionic {analysis['ionic_pct']:.0f}% (Pauling ionic character: {analysis['ionic_character']:.0f}%)"
+            )
+            st.markdown(f"**Estimated melting profile: {melt_label}**")
+            st.caption(melt_desc)
+
+        with tab_band:
+            fig_band = go.Figure()
+            if b_type == "Metallic" or bg <= 0.05:
+                fig_band.add_shape(type="rect", x0=0, x1=1, y0=-2, y1=1,
+                                    fillcolor=b_col, opacity=0.5, line=dict(width=0))
+                fig_band.add_annotation(x=0.5, y=-0.5, text="Overlapping Bands<br>(Conductor)",
+                                         showarrow=False, font=dict(color="white"))
+                y_range = [-2.5, 2]
+            else:
+                fig_band.add_shape(type="rect", x0=0, x1=1, y0=-2, y1=0,
+                                    fillcolor="#58a6ff", opacity=0.6, line=dict(width=0))
+                fig_band.add_shape(type="rect", x0=0, x1=1, y0=bg, y1=bg + 2,
+                                    fillcolor="#ff8000", opacity=0.6, line=dict(width=0))
+                fig_band.add_annotation(x=0.5, y=-1, text="Valence Band", showarrow=False, font=dict(color="white"))
+                fig_band.add_annotation(x=0.5, y=bg + 1, text="Conduction Band", showarrow=False, font=dict(color="white"))
+                fig_band.add_annotation(x=1.25, y=bg / 2, text=f"Eg = {bg:.2f} eV",
+                                         showarrow=False, font=dict(color=b_col, size=14))
+                y_range = [-2.5, max(bg + 2.5, 3)]
+            fig_band.update_layout(
+                height=300, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(visible=False, range=[-0.3, 1.7]),
+                yaxis=dict(title="Energy (eV, relative)", range=y_range, gridcolor="#21262d", color="white"),
+                margin=dict(t=20, b=20, l=10, r=10), showlegend=False,
+            )
+            st.plotly_chart(fig_band, use_container_width=True)
+            gap_label = ("Conductor" if (b_type == "Metallic" or bg <= 0.05)
+                         else "Semiconductor" if bg <= 3.0 else "Insulator")
+            st.caption(f"Classification: **{gap_label}** (Eg ≈ {bg:.2f} eV)")
+
+        with tab_mech:
+            cats = list(mech.keys())
+            vals = list(mech.values())
+            fig_radar = go.Figure()
+            fig_radar.add_trace(go.Scatterpolar(
+                r=vals + [vals[0]], theta=cats + [cats[0]], fill="toself",
+                line=dict(color=b_col), fillcolor=b_col, opacity=0.5,
+            ))
+            fig_radar.update_layout(
+                polar=dict(bgcolor="rgba(0,0,0,0)",
+                           radialaxis=dict(visible=True, range=[0, 100], color="white", gridcolor="#21262d"),
+                           angularaxis=dict(color="white")),
+                showlegend=False, paper_bgcolor="rgba(0,0,0,0)", font=dict(color="white"),
+                height=320, margin=dict(t=30, b=30, l=30, r=30),
+            )
+            st.plotly_chart(fig_radar, use_container_width=True)
+            st.caption("Heuristic engineering-trait estimate — not a substitute for measured elastic-tensor data.")
+
+        with tab_comp:
+            rows = []
+            for k, v in comp.items():
+                rows.append({
+                    "Sym": k, "n": v["n"], "χ": v["chi"], "Radius (Å)": v["rad"],
+                    "Group": v["group"], "Block": v["block"], "Valence e⁻": v["valence"],
+                })
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 else:
     st.error("Invalid Formula")
