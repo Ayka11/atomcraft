@@ -4,7 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 import re
 import json
-import streamlit.components.v1 as components
+# (st.iframe replaces components.v1.html below — no extra import needed)
 
 # ==========================================
 # 1. SCIENTIFIC DATA (Zero-Dependency)
@@ -336,11 +336,62 @@ def estimate_melting(category, is_molecule):
 st.set_page_config(page_title="AtomCraft v4.0", layout="wide")
 st.markdown("""
 <style>
-.main { background: linear-gradient(180deg, #0a0e14 0%, #0d1117 100%); color: #e6edf3; }
-section[data-testid="stSidebar"] { background: #0d1117; border-right: 1px solid #21262d; }
-div[data-testid="stMetricValue"] { font-size: 1.5rem; }
-div[data-testid="stMetric"] { background: #11161d; border: 1px solid #21262d; border-radius: 10px; padding: 10px; }
+/* Base app background + default text color */
+html, body, .main, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+    background-color: #0d1117 !important;
+    color: #e6edf3 !important;
+}
+[data-testid="stHeader"] { background-color: rgba(0,0,0,0) !important; }
+
+/* Headings / body text everywhere */
+h1, h2, h3, h4, h5, h6 { color: #f0f6fc !important; }
+.main p, .main span, .main label, .main li { color: #c9d1d9; }
+
+/* Sidebar */
+section[data-testid="stSidebar"] {
+    background-color: #11161d !important;
+    border-right: 1px solid #21262d;
+}
+section[data-testid="stSidebar"] * { color: #e6edf3 !important; }
+section[data-testid="stSidebar"] input {
+    background-color: #0d1117 !important;
+    color: #f0f6fc !important;
+    border: 1px solid #30363d !important;
+}
+
+/* Captions (was washing out to near-invisible grey) */
+[data-testid="stCaptionContainer"], .main small { color: #9aa4b2 !important; }
+
+/* Widget labels (Chemical Formula / Electron Cloud Density) */
+[data-testid="stWidgetLabel"] p { color: #c9d1d9 !important; font-weight: 500; }
+
+/* st.info box */
+[data-testid="stAlert"] { background-color: #11243d !important; border: 1px solid #1f3a5c; }
+[data-testid="stAlert"] * { color: #cfe3ff !important; }
+
+/* Metric cards */
+div[data-testid="stMetric"] {
+    background: #161b22 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 10px; padding: 12px;
+}
+[data-testid="stMetricLabel"] p { color: #8b949e !important; }
+div[data-testid="stMetricValue"] {
+    color: #f0f6fc !important;
+    font-size: 1.25rem !important;
+    white-space: normal !important;
+    overflow: visible !important;
+    text-overflow: unset !important;
+    line-height: 1.25 !important;
+}
+
+/* Tabs */
 .stTabs [data-baseweb="tab-list"] { gap: 4px; }
+.stTabs [data-baseweb="tab"] p { color: #8b949e !important; }
+.stTabs [aria-selected="true"] p { color: #f0f6fc !important; }
+
+/* Dataframe (Composition tab) */
+[data-testid="stDataFrame"] { color: #e6edf3 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -508,7 +559,7 @@ if comp:
             }})();
         </script>
         """
-        components.html(html_3d, height=520)
+        st.iframe(html_3d, height=520)
 
     # ======================= RIGHT: TELEMETRY =======================
     with c2:
@@ -533,18 +584,18 @@ if comp:
                                           line=dict(color="#444", width=1), showlegend=False))
             for label, (cx, cy) in corners.items():
                 fig_tri.add_trace(go.Scatter(x=[cx], y=[cy], mode="markers+text", text=[label],
-                                              textposition="bottom center", textfont=dict(color="#888"),
+                                              textposition="bottom center", textfont=dict(color="#aab4c0"),
                                               marker=dict(size=6, color="#666"), showlegend=False))
             fig_tri.add_trace(go.Scatter(x=[avg_chi], y=[delta_chi], mode="markers",
                                           marker=dict(size=16, color=b_col, line=dict(width=2, color="white")),
                                           showlegend=False))
             fig_tri.update_layout(
                 height=280, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                font={"color": "white"}, margin=dict(t=20, b=20, l=20, r=20),
-                xaxis=dict(title="Mean χ", range=[0.5, 3.2], gridcolor="#21262d"),
-                yaxis=dict(title="Δχ (ionic axis)", range=[-0.3, 3.6], gridcolor="#21262d"),
+                font=dict(color="#e6edf3"), margin=dict(t=20, b=20, l=20, r=20),
+                xaxis=dict(title="Mean χ", range=[0.5, 3.2], gridcolor="#21262d", tickfont=dict(color="#e6edf3")),
+                yaxis=dict(title="Δχ (ionic axis)", range=[-0.3, 3.6], gridcolor="#21262d", tickfont=dict(color="#e6edf3")),
             )
-            st.plotly_chart(fig_tri, use_container_width=True)
+            st.plotly_chart(fig_tri, theme=None)
             st.caption(
                 f"Metallic {analysis['metallic_pct']:.0f}% · Covalent {analysis['covalent_pct']:.0f}% · "
                 f"Ionic {analysis['ionic_pct']:.0f}% (Pauling ionic character: {analysis['ionic_character']:.0f}%)"
@@ -572,11 +623,13 @@ if comp:
                 y_range = [-2.5, max(bg + 2.5, 3)]
             fig_band.update_layout(
                 height=300, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#e6edf3"),
                 xaxis=dict(visible=False, range=[-0.3, 1.7]),
-                yaxis=dict(title="Energy (eV, relative)", range=y_range, gridcolor="#21262d", color="white"),
+                yaxis=dict(title="Energy (eV, relative)", range=y_range, gridcolor="#21262d",
+                           color="#e6edf3", tickfont=dict(color="#e6edf3")),
                 margin=dict(t=20, b=20, l=10, r=10), showlegend=False,
             )
-            st.plotly_chart(fig_band, use_container_width=True)
+            st.plotly_chart(fig_band, theme=None)
             gap_label = ("Conductor" if (b_type == "Metallic" or bg <= 0.05)
                          else "Semiconductor" if bg <= 3.0 else "Insulator")
             st.caption(f"Classification: **{gap_label}** (Eg ≈ {bg:.2f} eV)")
@@ -591,12 +644,13 @@ if comp:
             ))
             fig_radar.update_layout(
                 polar=dict(bgcolor="rgba(0,0,0,0)",
-                           radialaxis=dict(visible=True, range=[0, 100], color="white", gridcolor="#21262d"),
-                           angularaxis=dict(color="white")),
-                showlegend=False, paper_bgcolor="rgba(0,0,0,0)", font=dict(color="white"),
+                           radialaxis=dict(visible=True, range=[0, 100], color="#e6edf3",
+                                            gridcolor="#21262d", tickfont=dict(color="#e6edf3")),
+                           angularaxis=dict(color="#e6edf3", tickfont=dict(color="#e6edf3"))),
+                showlegend=False, paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e6edf3"),
                 height=320, margin=dict(t=30, b=30, l=30, r=30),
             )
-            st.plotly_chart(fig_radar, use_container_width=True)
+            st.plotly_chart(fig_radar, theme=None)
             st.caption("Heuristic engineering-trait estimate — not a substitute for measured elastic-tensor data.")
 
         with tab_comp:
@@ -606,6 +660,6 @@ if comp:
                     "Sym": k, "n": v["n"], "χ": v["chi"], "Radius (Å)": v["rad"],
                     "Group": v["group"], "Block": v["block"], "Valence e⁻": v["valence"],
                 })
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(rows), hide_index=True)
 else:
     st.error("Invalid Formula")
