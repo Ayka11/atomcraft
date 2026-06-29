@@ -31,12 +31,12 @@ st.set_page_config(page_title="AtomCraft Pro", layout="wide")
 st.markdown("<style>.main { background: #0d1117; color: white; }</style>", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🔬 AtomCraft v2.3")
+    st.title("🔬 AtomCraft v2.4")
     user_input = st.text_input("Formula", value="NaCl")
-    iso_val = st.slider("Electron Cloud", 0.01, 0.50, 0.15)
-    st.success("Engine: WebGL Stability Patch Applied")
+    iso_val = st.slider("Electron Cloud Density", 0.01, 0.50, 0.15)
+    st.info("System Status: Bootstrapping WebGL Visualizer...")
 
-# --- 3. LOGIC ---
+# --- 3. PROCESSING ---
 comp = smart_parse(user_input)
 
 if comp:
@@ -49,62 +49,73 @@ if comp:
     elif avg_chi < 1.9 and delta_chi < 0.8: b_type, b_col = "Metallic", "#58a6ff"
     else: b_type, b_col = "Covalent", "#3fb950"
 
-    c1, c2 = st.columns([2, 1])
+    col_v, col_m = st.columns([2, 1])
 
-    with c1:
-        st.subheader(f"3D Visualizer: {user_input}")
+    with col_v:
+        st.subheader(f"Structure: {user_input}")
         
-        # Build Atom List
+        # Build Lattice Data
         atoms_js = []
         els = list(comp.keys())
-        for i in range(2):
-            for j in range(2):
-                for k in range(2):
-                    sym = els[(i+j+k) % len(els)]
-                    atoms_js.append(f"{{x:{i*4}, y:{j*4}, z:{k*4}, col:'{comp[sym]['d']['col']}'}}")
+        for i in [0, 5]:
+            for j in [0, 5]:
+                for k in [0, 5]:
+                    sym = els[(i+j+k)//5 % len(els)]
+                    atoms_js.append(f"{{x:{i}, y:{j}, z:{k}, color:'{comp[sym]['d']['col']}'}}")
         
-        # SUPER STABLE VISUALIZER HTML
+        # --- BULLETPROOF HTML ---
         html_3d = f"""
-        <div id="wrapper" style="height: 500px; width: 100%; display: flex;">
-            <div id="container" style="flex: 1; width: 100%; height: 100%; position: relative;"></div>
-        </div>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/3Dmol/2.0.4/3Dmol-min.js"></script>
+        <div id="loading" style="color: #58a6ff; font-family: sans-serif; padding: 20px;">Initializing WebGL...</div>
+        <div id="container" style="height: 500px; width: 100%; position: relative; display:none;"></div>
+        
+        <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+        <script src="https://unpkg.com/3dmol@2.0.1/build/3Dmol-min.js"></script>
+        
         <script>
-            (function() {{
-                const start = () => {{
-                    if (typeof $3Dmol === 'undefined') {{
-                        setTimeout(start, 100);
-                        return;
-                    }}
+        $(document).ready(function() {{
+            let checkExist = setInterval(function() {{
+                if (typeof $3Dmol !== 'undefined' && $('#container').width() > 0) {{
+                    clearInterval(checkExist);
+                    renderModel();
+                }}
+            }}, 100);
+
+            function renderModel() {{
+                $('#loading').hide();
+                $('#container').show();
+                
+                try {{
+                    let element = $('#container');
+                    let viewer = $3Dmol.createViewer(element, {{ backgroundColor: '#0b0e14' }});
+                    let atoms = {atoms_js};
                     
-                    const element = document.getElementById('container');
-                    // This is the fix for the "size" error: 
-                    // ensure the element has dimensions before initializing
-                    const viewer = $3Dmol.createViewer($(element), {{ backgroundColor: '#0b0e14' }});
-                    
-                    const atoms = {atoms_js};
                     atoms.forEach(a => {{
-                        viewer.addSphere({{center:{{x:a.x, y:a.y, z:a.z}}, radius:1.2, color:a.col}});
+                        viewer.addSphere({{center:{{x:a.x, y:a.y, z:a.z}}, radius:1.5, color:a.color}});
                     }});
                     
-                    viewer.addIsosurface(null, {{isoval: {iso_val}, color: '{b_col}', opacity: 0.3}});
+                    viewer.addIsosurface(null, {{
+                        isoval: {iso_val}, 
+                        color: '{b_col}', 
+                        opacity: 0.35
+                    }});
+                    
                     viewer.zoomTo();
                     viewer.render();
                     
-                    // Handle responsive resizing
-                    window.addEventListener('resize', () => {{ viewer.resize(); }});
-                }};
-
-                if (document.readyState === 'complete') {{ start(); }} 
-                else {{ window.addEventListener('load', start); }}
-            }})();
+                    // Trigger a second render after 500ms to ensure correct sizing
+                    setTimeout(() => {{ viewer.resize(); viewer.render(); }}, 500);
+                }} catch (err) {{
+                    $('#loading').show().text("Error: " + err.message);
+                }}
+            }}
+        }});
         </script>
         """
         components.html(html_3d, height=520)
 
-    with c2:
+    with col_m:
         st.subheader("Metrics")
-        st.write(f"**Bond Type:** <span style='color:{b_col}; font-weight:bold; font-size:24px;'>{b_type}</span>", unsafe_allow_html=True)
+        st.write(f"**Bonding:** <span style='color:{b_col}; font-weight:bold; font-size:24px;'>{b_type}</span>", unsafe_allow_html=True)
         
         bg = max(0, (delta_chi * 2.1) - 0.4) if b_type != "Metallic" else 0
         fig = go.Figure(go.Indicator(
@@ -112,8 +123,10 @@ if comp:
             title = {'text': "Band Gap (eV)"},
             gauge = {'axis': {'range': [0, 10]}, 'bar': {'color': b_col}}
         ))
-        fig.update_layout(height=280, paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"}, margin=dict(l=20,r=20,t=40,b=20))
+        fig.update_layout(height=250, paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"}, margin=dict(l=30,r=30,t=40,b=20))
         st.plotly_chart(fig, use_container_width=True)
-        st.table(pd.DataFrame([{"Element": k, "χ": v['d']['chi']} for k, v in comp.items()]))
+        
+        st.dataframe(pd.DataFrame([{"Element": k, "χ (Pauling)": v['d']['chi']} for k, v in comp.items()]), hide_index=True)
+
 else:
-    st.error("Invalid Formula. Try 'NaCl', 'TiO2', or 'h2o'.")
+    st.error("Invalid formula. Please use standard notation like NaCl, h2o, or TiO2.")
