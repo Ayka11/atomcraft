@@ -31,6 +31,8 @@ def parse_formula(formula):
     matches = re.findall(r'([A-Z][a-z]*)(\d*)', formula)
     parsed = {}
     for sym, count in matches:
+        if not sym:
+            continue
         d = get_el_data(sym)
         parsed[sym] = {"n": int(count) if count else 1, "chi": d[0], "rad": d[1], "col": d[2]}
     return parsed
@@ -38,14 +40,14 @@ def parse_formula(formula):
 # ==========================================
 # 2. APP CONFIGURATION
 # ==========================================
-st.set_page_config(page_title="AtomCraft Pro v3.3", layout="wide")
+st.set_page_config(page_title="AtomCraft Pro v3.4", layout="wide")
 st.markdown("<style>.main { background: #0d1117; color: white; }</style>", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("🔬 AtomCraft v3.3")
+    st.title("🔬 AtomCraft v3.4")
     user_input = st.text_input("Chemical Formula", value="NaCl")
     iso_val = st.slider("Electron Cloud Density", 0.01, 0.50, 0.12)
-    st.info("System: Declarative WebGL Mode (No-Size-Error)")
+    st.info("System: Manual WebGL Init (Fixed)")
 
 # ==========================================
 # 3. COMPUTATION
@@ -58,72 +60,72 @@ if comp:
     all_chi = [v['chi'] for v in v_list]
     delta_chi = max(all_chi) - min(all_chi)
     avg_chi = sum(v['chi'] * v['n'] for v in v_list) / total_n
-    
-    if delta_chi > 1.7: b_type, b_col = "Ionic", "#ff4b4b"
-    elif avg_chi < 1.9 and delta_chi < 1.0: b_type, b_col = "Metallic", "#58a6ff"
-    else: b_type, b_col = "Covalent", "#3fb950"
+
+    if delta_chi > 1.7:
+        b_type, b_col = "Ionic", "#ff4b4b"
+    elif avg_chi < 1.9 and delta_chi < 1.0:
+        b_type, b_col = "Metallic", "#58a6ff"
+    else:
+        b_type, b_col = "Covalent", "#3fb950"
 
     c1, c2 = st.columns([2, 1])
 
     with c1:
         st.subheader(f"Molecular Lattice: {user_input}")
-        
-        # Build XYZ string
-        els = list(comp.keys())
-        xyz = f"8\\nAtomCraft v3.3\\n"
-        idx = 0
-        for x in [0, 5]:
-            for y in [0, 5]:
-                for z in [0, 5]:
-                    sym = els[idx % len(els)]
-                    xyz += f"{sym} {x} {y} {z}\\n"
-                    idx += 1
 
-        # --- THE BULLETPROOF WEBGL COMPONENT ---
-        # 1. We use 'viewer_3Dmoljs' class for AUTO-INITIALIZATION.
-        # 2. We use a style string that 3Dmol parses internally.
-        # 3. We use a small script only to force a resize after the page settles.
+        # ---- Build a PROPERLY newlined XYZ block (mock 8-atom cubic lattice) ----
+        # BUG FIXED: the original used "\\n" (a literal backslash+n), which is
+        # NOT a line break, so the 3Dmol XYZ parser could never split atoms.
+        els = list(comp.keys())
+        atom_lines = []
+        idx = 0
+        for x in [0, 3]:
+            for y in [0, 3]:
+                for z in [0, 3]:
+                    sym = els[idx % len(els)]
+                    atom_lines.append(f"{sym} {x:.2f} {y:.2f} {z:.2f}")
+                    idx += 1
+        xyz = f"{len(atom_lines)}\nAtomCraft v3.4\n" + "\n".join(atom_lines)
+
+        # Slider -> VDW surface "scale". Higher density value = tighter,
+        # more contracted envelope (mimics a higher iso-value cutoff).
+        # Swap this whole block for a real isosurface built from a CIF /
+        # volumetric DFT grid once Live API Mode supplies actual density data.
+        surf_scale = max(0.3, 1.6 - (iso_val * 3.0))
+
         html_3d = f"""
-        <div id="container" 
-             style="height: 500px; width: 100%; background-color: #0b0e14; border-radius: 10px; position: relative;"
-             class='viewer_3Dmoljs' 
-             data-backgroundcolor='0x0b0e14' 
-             data-style='{{"sphere":{{"radius":1.5}}}}'
-             data-ui='true'>
-            <textarea id="model_data" style="display:none;">{xyz}</textarea>
-        </div>
-        
-        <script src="https://code.jquery.com/jquery-3.6.3.min.js"></script>
-        <script src="https://3dmol.org/build/3Dmol-min.js"></script>
-        
+        <div id="viewer3d" style="height: 500px; width: 100%; background-color: #0b0e14; border-radius: 10px;"></div>
+        <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
         <script>
-            $(document).ready(function() {{
-                // Let the library auto-init, then we just find it in the registry
-                let checkReady = setInterval(() => {{
-                    let viewer = $3Dmol.viewers['container'] || $3Dmol.viewers[0];
-                    if (viewer) {{
-                        clearInterval(checkReady);
-                        viewer.addModel($('#model_data').val(), "xyz");
-                        viewer.setStyle({{}}, {{sphere: {{radius: 1.5}}}});
-                        viewer.addIsosurface(null, {{
-                            isoval: {iso_val},
-                            color: '{b_col}',
-                            opacity: 0.35
-                        }});
-                        viewer.zoomTo();
-                        viewer.render();
-                        
-                        // Fix for the 'size' error: force resize once width is non-zero
-                        let fixSize = setInterval(() => {{
-                            if($('#container').width() > 0) {{
-                                viewer.resize();
-                                viewer.render();
-                                clearInterval(fixSize);
-                            }}
-                        }}, 100);
-                    }}
-                }}, 100);
-            }});
+            (function() {{
+                let element = document.getElementById('viewer3d');
+                let viewer = $3Dmol.createViewer(element, {{ backgroundColor: '0x0b0e14' }});
+
+                let xyzData = `{xyz}`;
+                viewer.addModel(xyzData, "xyz");
+
+                viewer.setStyle({{}}, {{
+                    sphere: {{ radius: 0.55, colorscheme: 'Jmol' }},
+                    stick: {{ radius: 0.12, color: 'grey' }}
+                }});
+
+                // BUG FIXED: addIsosurface(null, ...) is invalid — it needs real
+                // volumetric grid data and throws on null, which silently killed
+                // the rest of the render. A VDW surface is the correct stand-in
+                // for an "electron cloud" envelope when no DFT grid exists.
+                viewer.addSurface($3Dmol.SurfaceType.VDW, {{
+                    opacity: 0.35,
+                    color: '{b_col}',
+                    scale: {surf_scale}
+                }});
+
+                viewer.zoomTo();
+                viewer.render();
+
+                window.addEventListener('resize', function() {{
+                    viewer.resize();
+                }});
+            }})();
         </script>
         """
         components.html(html_3d, height=520)
@@ -131,14 +133,14 @@ if comp:
     with c2:
         st.subheader("Analysis")
         st.metric("Bonding Type", b_type)
-        
+
         bg = max(0, (delta_chi * 2.1) - 0.4) if b_type != "Metallic" else 0
         fig = go.Figure(go.Indicator(
-            mode = "gauge+number", value = bg,
-            title = {'text': "Band Gap (eV)"},
-            gauge = {'axis': {'range': [0, 10]}, 'bar': {'color': b_col}}
+            mode="gauge+number", value=bg,
+            title={'text': "Band Gap (eV)"},
+            gauge={'axis': {'range': [0, 10]}, 'bar': {'color': b_col}}
         ))
-        fig.update_layout(height=280, paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"}, margin=dict(t=50,b=20))
+        fig.update_layout(height=280, paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"}, margin=dict(t=50, b=20))
         st.plotly_chart(fig, use_container_width=True)
         st.table(pd.DataFrame([{"Sym": k, "χ": v['chi']} for k, v in comp.items()]))
 else:
