@@ -86,11 +86,22 @@ if comp:
 
         atom_lines = []
 
-        if len(comp) == 2 and total_atoms <= 6 and hub_candidates:
-            # --- Discrete small "hub" molecule (AB, AB2, AB3, AB4 style) ---
-            hub = hub_candidates[0]
-            others = [s for s in comp if s != hub for _ in range(counts[s])]
-            bond_len = 1.0  # representative covalent bond length (A)
+        # Hub priority: real "central" atoms in chemistry are virtually never
+        # H, and rarely O — prefer other single-count elements as the hub
+        # (e.g. C in H2CO4) before falling back to O, then H.
+        def hub_score(s):
+            return (s == "H") + (s == "O") * 0.5
+        hub_candidates_sorted = sorted(hub_candidates, key=hub_score)
+
+        if hub_candidates_sorted and total_atoms <= 12:
+            # --- Discrete small "hub" molecule: hub atom + ALL remaining atoms,
+            # respecting their real counts (works for any number of unique
+            # elements, e.g. H2, C1, O4 in H2CO4 -> 6 atoms around the hub) ---
+            hub = hub_candidates_sorted[0]
+            expanded = [s for s, n in counts.items() for _ in range(n)]
+            others = expanded.copy()
+            others.remove(hub)
+            bond_len = 1.1  # representative covalent bond length (A)
 
             atom_lines.append(f"{hub} 0.00 0.00 0.00")
             n_others = len(others)
@@ -101,30 +112,51 @@ if comp:
                 dx, dy = bond_len * np.cos(half_angle), bond_len * np.sin(half_angle)
                 atom_lines.append(f"{others[0]} {dx:.2f} {dy:.2f} 0.00")
                 atom_lines.append(f"{others[1]} {dx:.2f} {-dy:.2f} 0.00")
-            elif n_others == 3:
-                for i, sym2 in enumerate(others):
-                    theta = np.radians(120 * i)
-                    x = bond_len * np.cos(theta)
-                    y = bond_len * np.sin(theta)
-                    atom_lines.append(f"{sym2} {x:.2f} {y:.2f} 0.30")
             else:
-                tetra_dirs = [(1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)]
-                norm = np.sqrt(3)
-                for i, sym2 in enumerate(others[:4]):
-                    vx, vy, vz = tetra_dirs[i]
+                # Generic even spread on a sphere around the hub for 3+
+                # surrounding atoms (Fibonacci sphere) so every single atom in
+                # the formula gets a position — none are silently dropped.
+                golden_angle = np.pi * (3 - np.sqrt(5))
+                for i, sym2 in enumerate(others):
+                    y = 1 - (i / float(n_others - 1)) * 2 if n_others > 1 else 0
+                    r = np.sqrt(max(0.0, 1 - y * y))
+                    theta = golden_angle * i
+                    x, z = np.cos(theta) * r, np.sin(theta) * r
                     atom_lines.append(
-                        f"{sym2} {bond_len*vx/norm:.2f} {bond_len*vy/norm:.2f} {bond_len*vz/norm:.2f}"
+                        f"{sym2} {bond_len*x:.2f} {bond_len*y:.2f} {bond_len*z:.2f}"
                     )
         else:
-            # --- Extended solid: mock alternating cubic lattice (unchanged approach) ---
-            els = list(comp.keys())
-            idx = 0
-            for x in [0, 3]:
-                for y in [0, 3]:
-                    for z in [0, 3]:
-                        sym = els[idx % len(els)]
-                        atom_lines.append(f"{sym} {x:.2f} {y:.2f} {z:.2f}")
-                        idx += 1
+            # --- Extended solid: cubic lattice SIZED to the real atom count ---
+            # BUG FIXED (accuracy): this used to be hard-capped at 8 fixed grid
+            # corners and cycled only the *unique* symbols modulo 8, so any
+            # formula with >2 unique elements (or counts that don't divide
+            # evenly into 8) rendered the wrong number of each atom type.
+            # Now every atom the formula actually specifies gets placed, in a
+            # round-robin (interleaved) order so the lattice still alternates
+            # visually rather than clumping same-type atoms together.
+            buckets = {sym: [sym] * n for sym, n in counts.items()}
+            interleaved = []
+            while any(buckets.values()):
+                for sym in list(buckets.keys()):
+                    if buckets[sym]:
+                        interleaved.append(buckets[sym].pop(0))
+
+            spacing = 2.5
+            dim = max(2, int(np.ceil(total_atoms ** (1 / 3))))
+            grid_positions = []
+            for x in range(dim):
+                for y in range(dim):
+                    for z in range(dim):
+                        grid_positions.append((x * spacing, y * spacing, z * spacing))
+                        if len(grid_positions) >= total_atoms:
+                            break
+                    if len(grid_positions) >= total_atoms:
+                        break
+                if len(grid_positions) >= total_atoms:
+                    break
+
+            for sym, (x, y, z) in zip(interleaved, grid_positions):
+                atom_lines.append(f"{sym} {x:.2f} {y:.2f} {z:.2f}")
 
         xyz = f"{len(atom_lines)}\nAtomCraft v3.4\n" + "\n".join(atom_lines)
 
