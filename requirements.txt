@@ -1,6 +1,7 @@
 streamlit
-plotly
 pandas
 numpy
 mp-api
 mendeleev
+plotly
+pytest
