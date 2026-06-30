@@ -342,6 +342,22 @@ def is_molecule_heuristic(comp):
     return bool(hub_candidates) and total_atoms <= 12 and len(comp) >= 2
 
 
+def compute_ionic_fraction(comp):
+    """This compound's own ionic-character fraction (0-1), via the same van
+    Arkel analysis used for bonding classification. Shared by every visual
+    effect that should scale with 'how ionic is this specific species' —
+    bond/lattice stretch, electron-cloud solvation blur — so a single
+    consistent definition of 'ionic' drives all of them."""
+    if len(comp) < 2:
+        return 0.0
+    v_list = list(comp.values())
+    total_n = sum(v['n'] for v in v_list)
+    all_chi = [v['chi'] for v in v_list]
+    delta_chi = max(all_chi) - min(all_chi)
+    avg_chi = sum(v['chi'] * v['n'] for v in v_list) / total_n
+    return van_arkel_analysis(avg_chi, delta_chi, symbols=list(comp.keys()))["ionic_character"] / 100
+
+
 # ==========================================
 # 3.5 GEOMETRY + 3D RENDERING (shared by both modes)
 # ==========================================
@@ -356,29 +372,20 @@ def build_geometry(comp, max_render_atoms=60, epsilon=1.0):
     only changed a numeric ΔG correction — nothing in the 3D scene
     responded to it at all. Bond lengths and lattice spacing are now
     scaled by a 'dissociation stretch' factor that grows with this
-    compound's OWN ionic character (computed via the same van Arkel
-    analysis used for bonding classification) and with how far epsilon is
-    above 1 (vacuum/gas-phase, where the factor is exactly 1.0 — i.e. no
-    visual change at the default slider position, matching the existing
-    ΔG correction's zero-at-vacuum behavior). This directly visualizes
-    ionization/solvation: a polar medium genuinely pulls an ionic lattice's
-    atoms apart (real dissociation into separated, solvated ions), while a
-    covalent network or metal — which doesn't ionize the same way — stays
-    essentially unchanged regardless of solvent polarity."""
+    compound's OWN ionic character (compute_ionic_fraction) and with how
+    far epsilon is above 1 (vacuum/gas-phase, where the factor is exactly
+    1.0 — i.e. no visual change at the default slider position, matching
+    the existing ΔG correction's zero-at-vacuum behavior). This directly
+    visualizes ionization/solvation: a polar medium genuinely pulls an
+    ionic lattice's atoms apart (real dissociation into separated, solvated
+    ions), while a covalent network or metal — which doesn't ionize the
+    same way — stays essentially unchanged regardless of solvent polarity."""
     counts = {sym: v['n'] for sym, v in comp.items()}
     total_atoms = sum(counts.values())
     if total_atoms == 0:
         return [], 0, 0, False
 
-    if len(comp) >= 2:
-        v_list = list(comp.values())
-        total_n = sum(v['n'] for v in v_list)
-        all_chi = [v['chi'] for v in v_list]
-        delta_chi = max(all_chi) - min(all_chi)
-        avg_chi = sum(v['chi'] * v['n'] for v in v_list) / total_n
-        ionic_frac = van_arkel_analysis(avg_chi, delta_chi, symbols=list(comp.keys()))["ionic_character"] / 100
-    else:
-        ionic_frac = 0.0
+    ionic_frac = compute_ionic_fraction(comp)
     stretch = 1.0 + ionic_frac * min(1.5, max(0.0, epsilon - 1.0) / 30.0)
 
     is_molecule = is_molecule_heuristic(comp)
@@ -467,10 +474,34 @@ def build_radius_map(comp):
     return {sym: round(max(0.28, min(0.85, v['rad'] * 0.45)), 3) for sym, v in comp.items()}
 
 
-def build_density_atoms(atom_lines, comp):
+def build_density_atoms(atom_lines, comp, temp_k=298.0, epsilon=1.0):
     """Per-atom (position, valence weight, gaussian width) used to
     synthesize a fake electron-density grid for the isosurface — see
-    render_3dmol_html for why this exists instead of a no-op 'scale'."""
+    render_3dmol_html for why this exists instead of a no-op 'scale'.
+
+    Two physical effects scale the Gaussian width (sigma), i.e. how
+    diffuse/blurry each atom's electron cloud looks:
+
+    1. THERMAL MOTION (Debye-Waller-style): real atoms in a lattice or
+    molecule vibrate, and the RMS vibrational amplitude scales with
+    sqrt(T) in the classical (high-temperature) limit — this is exactly
+    why X-ray/neutron crystallography atomic displacement parameters
+    (B-factors) grow with temperature, blurring the time-averaged electron
+    density. thermal_factor = 1.0 exactly at T=298K (the slider's default),
+    floored at 0.5 rather than going to zero — even at very low T, real
+    atoms still have nonzero zero-point vibrational motion.
+
+    2. IONIC SOLVATION BLUR: in a polar medium, dissociated ions get
+    surrounded by a diffuse solvation shell (solvent molecules orienting
+    around the ion) — visualized here as the electron cloud for ionic-
+    character atoms spreading out further as epsilon increases, on top of
+    (and independent from) the bond/lattice stretch in build_geometry.
+    Defaults to exactly 1.0 at epsilon=1 (vacuum)."""
+    thermal_factor = max(0.5, 1.0 + 0.6 * (math.sqrt(max(temp_k, 50.0) / 298.0) - 1.0))
+    ionic_frac = compute_ionic_fraction(comp)
+    solvation_blur = 1.0 + ionic_frac * min(1.2, max(0.0, epsilon - 1.0) / 40.0)
+    sigma_scale = thermal_factor * solvation_blur
+
     atoms = []
     for line in atom_lines:
         parts = line.split()
@@ -478,12 +509,13 @@ def build_density_atoms(atom_lines, comp):
         atoms.append({
             "x": x, "y": y, "z": z,
             "w": float(comp[sym]['valence']),
-            "sigma": max(0.45, comp[sym]['rad'] * 0.55),
+            "sigma": max(0.45, comp[sym]['rad'] * 0.55) * sigma_scale,
         })
     return atoms
 
 
-def build_species_layout(species_list, spacing=3.0, per_species_cap=16, max_species_shown=6, epsilon=1.0):
+def build_species_layout(species_list, spacing=3.0, per_species_cap=16, max_species_shown=6,
+                          epsilon=1.0, temp_k=298.0, pressure_atm=1.0):
     """Lays out each species in a reactant/product list as its OWN distinct,
     spatially-separated cluster within one shared scene, instead of merging
     every species' atom counts into a single blob.
@@ -502,15 +534,35 @@ def build_species_layout(species_list, spacing=3.0, per_species_cap=16, max_spec
     visible gaps, so 'before' visibly reads as separate molecules and
     'after' visibly reads as a different, bonded structure.
 
-    Returns (atom_lines, total_atoms_real, rendered_atom_count, display_comp)
-    where display_comp is a merged {symbol: element_data} dict (counts
-    aside) so build_radius_map/build_density_atoms can look up any element
-    appearing in any of the species, regardless of which species it's in.
+    PRESSURE: at the everyday pressures this slider covers (1-500 atm),
+    real compression of a solid/liquid's internal bond lengths is
+    genuinely imperceptible — for a typical bulk modulus (~50-200 GPa),
+    500 atm (~0.05 GPa) compresses a lattice by a few hundredths of a
+    percent, far below what's worth faking visually. So pressure is NOT
+    applied to intra-species bond/lattice spacing (build_geometry ignores
+    it). What IS physically significant at these pressures is gas
+    density/volume (PV = nRT) — so pressure instead compresses the GAP
+    BETWEEN separate species clusters here, which is the most defensible
+    place to show 'higher pressure packs molecules closer together'
+    without overstating solid-state compressibility. compression=1.0
+    exactly at P=1 atm (no change from prior behavior).
+
+    Returns (atom_lines, total_atoms_real, rendered_atom_count,
+    display_comp, truncated_species, density_atoms) where display_comp is
+    a merged {symbol: element_data} dict (counts aside, just for radius
+    lookups) and density_atoms is built PER-SPECIES (each species' own
+    ionic character drives its own thermal/solvation blur, then positions
+    are shifted by that species' offset) rather than on the flattened
+    blob, for the same reason the geometry itself is built per-species.
     """
     shown = species_list[:max_species_shown]
     truncated_species = len(species_list) > max_species_shown
 
+    compression = 1.0 / (1.0 + 0.3 * math.log10(max(pressure_atm, 1.0)))
+    effective_spacing = spacing * compression
+
     atom_lines_all = []
+    density_atoms_all = []
     display_comp = {}
     offset_x = 0.0
     total_atoms_real = 0
@@ -522,17 +574,22 @@ def build_species_layout(species_list, spacing=3.0, per_species_cap=16, max_spec
         lines, total, rendered, _ = build_geometry(comp, max_render_atoms=per_species_cap, epsilon=epsilon)
         total_atoms_real += total
 
+        local_density = build_density_atoms(lines, comp, temp_k=temp_k, epsilon=epsilon)
+
         xs = []
         for line in lines:
             parts = line.split()
             sym, x, y, z = parts[0], float(parts[1]), float(parts[2]), float(parts[3])
             xs.append(x)
             atom_lines_all.append(f"{sym} {x + offset_x:.2f} {y:.2f} {z:.2f}")
+        for da in local_density:
+            da["x"] += offset_x
+            density_atoms_all.append(da)
 
         cluster_width = (max(xs) - min(xs)) if xs else 0.0
-        offset_x += cluster_width + spacing
+        offset_x += cluster_width + effective_spacing
 
-    return atom_lines_all, total_atoms_real, len(atom_lines_all), display_comp, truncated_species
+    return atom_lines_all, total_atoms_real, len(atom_lines_all), display_comp, truncated_species, density_atoms_all
 
 
 
@@ -1261,13 +1318,21 @@ else:
         with c_ctrl:
             st.subheader("Reaction Controls")
             temp = st.slider("Temperature (K)", 100, 3000, 298,
-                              help="Used directly in ΔG = ΔH - TΔS.")
+                              help="Used in ΔG = ΔH - TΔS. Also visually blurs the "
+                                   "electron-cloud isosurface in the 3D viewports — "
+                                   "real atomic vibration amplitude grows with √T "
+                                   "(the same effect behind crystallography's "
+                                   "temperature-dependent B-factors). No change at "
+                                   "298K (the default).")
             pressure = st.slider(
                 "Pressure (atm)", 1, 500, 1,
-                help="Only changes ΔG when the reaction's gas-phase mole "
-                     "count differs between products and reactants "
-                     "(Δn_gas ≠ 0), via ΔG_pressure = Δn_gas · R · T · ln(P) "
-                     "— the real ideal-gas free-energy/pressure relationship."
+                help="Changes ΔG when the reaction's gas-phase mole count differs "
+                     "between products and reactants (Δn_gas ≠ 0), via "
+                     "ΔG_pressure = Δn_gas · R · T · ln(P). Also visually compresses "
+                     "the spacing BETWEEN separate species in the 3D viewports "
+                     "(real gas compression, PV=nRT) — bond lengths within a single "
+                     "species aren't compressed, since that effect is genuinely "
+                     "imperceptible below GPa-scale pressures. No change at 1 atm."
             )
 
             st.markdown("**Reaction Environment**")
@@ -1356,27 +1421,27 @@ else:
 
             with v1:
                 st.caption("Reactant State — " + ", ".join(f"{r['coeff']}{r['formula']}" for r in reactants))
-                r_atom_lines, r_total, r_rendered, r_display_comp, r_trunc = build_species_layout(reactants, epsilon=epsilon)
+                (r_atom_lines, r_total, r_rendered, r_display_comp, r_trunc,
+                 r_density_atoms) = build_species_layout(reactants, epsilon=epsilon, temp_k=temp, pressure_atm=pressure)
                 if r_rendered < r_total:
                     st.caption(f"⚠️ Rendering {r_rendered} of {r_total} atoms.")
                 if r_trunc:
                     st.caption("⚠️ Showing first 6 species only.")
                 r_xyz = f"{len(r_atom_lines)}\nReactants\n" + "\n".join(r_atom_lines)
                 r_radius_map = build_radius_map(r_display_comp)
-                r_density_atoms = build_density_atoms(r_atom_lines, r_display_comp)
                 r_html = render_3dmol_html("viewerReact", r_xyz, r_radius_map, r_density_atoms, r_col, iso_val, height=320)
                 st.iframe(r_html, height=320)
 
             with v2:
                 st.caption("Product State — " + ", ".join(f"{p['coeff']}{p['formula']}" for p in products))
-                p_atom_lines, p_total, p_rendered, p_display_comp, p_trunc = build_species_layout(products, epsilon=epsilon)
+                (p_atom_lines, p_total, p_rendered, p_display_comp, p_trunc,
+                 p_density_atoms) = build_species_layout(products, epsilon=epsilon, temp_k=temp, pressure_atm=pressure)
                 if p_rendered < p_total:
                     st.caption(f"⚠️ Rendering {p_rendered} of {p_total} atoms.")
                 if p_trunc:
                     st.caption("⚠️ Showing first 6 species only.")
                 p_xyz = f"{len(p_atom_lines)}\nProducts\n" + "\n".join(p_atom_lines)
                 p_radius_map = build_radius_map(p_display_comp)
-                p_density_atoms = build_density_atoms(p_atom_lines, p_display_comp)
                 p_html = render_3dmol_html("viewerProd", p_xyz, p_radius_map, p_density_atoms, p_col, iso_val, height=320)
                 st.iframe(p_html, height=320)
 
