@@ -4,6 +4,8 @@ import numpy as np
 import plotly.graph_objects as go
 import re
 import json
+import math
+import functools
 # (st.iframe replaces components.v1.html below — no extra import needed)
 
 # ==========================================
@@ -330,258 +332,165 @@ def estimate_melting(category, is_molecule):
     return "Moderate", "Polar covalent network — intermediate bond strength."
 
 
-# ==========================================
-# 4. APP CONFIGURATION & THEME
-# ==========================================
-st.set_page_config(page_title="AtomCraft v4.0", layout="wide")
-st.markdown("""
-<style>
-/* Base app background + default text color */
-html, body, .main, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
-    background-color: #0d1117 !important;
-    color: #e6edf3 !important;
-}
-[data-testid="stHeader"] { background-color: rgba(0,0,0,0) !important; }
-
-/* Headings / body text everywhere */
-h1, h2, h3, h4, h5, h6 { color: #f0f6fc !important; }
-.main p, .main span, .main label, .main li { color: #c9d1d9; }
-
-/* Sidebar */
-section[data-testid="stSidebar"] {
-    background-color: #11161d !important;
-    border-right: 1px solid #21262d;
-}
-section[data-testid="stSidebar"] * { color: #e6edf3 !important; }
-section[data-testid="stSidebar"] input {
-    background-color: #0d1117 !important;
-    color: #f0f6fc !important;
-    border: 1px solid #30363d !important;
-}
-
-/* Captions (was washing out to near-invisible grey) */
-[data-testid="stCaptionContainer"], .main small { color: #9aa4b2 !important; }
-
-/* Widget labels (Chemical Formula / Electron Cloud Density) */
-[data-testid="stWidgetLabel"] p { color: #c9d1d9 !important; font-weight: 500; }
-
-/* st.info box */
-[data-testid="stAlert"] { background-color: #11243d !important; border: 1px solid #1f3a5c; }
-[data-testid="stAlert"] * { color: #cfe3ff !important; }
-
-/* Metric cards */
-div[data-testid="stMetric"] {
-    background: #161b22 !important;
-    border: 1px solid #30363d !important;
-    border-radius: 10px; padding: 12px;
-}
-[data-testid="stMetricLabel"] p { color: #8b949e !important; }
-div[data-testid="stMetricValue"] {
-    color: #f0f6fc !important;
-    font-size: 1.25rem !important;
-    white-space: normal !important;
-    overflow: visible !important;
-    text-overflow: unset !important;
-    line-height: 1.25 !important;
-}
-
-/* Tabs */
-.stTabs [data-baseweb="tab-list"] { gap: 4px; }
-.stTabs [data-baseweb="tab"] p { color: #8b949e !important; }
-.stTabs [aria-selected="true"] p { color: #f0f6fc !important; }
-
-/* Dataframe (Composition tab) */
-[data-testid="stDataFrame"] { color: #e6edf3 !important; }
-</style>
-""", unsafe_allow_html=True)
-
-with st.sidebar:
-    st.title("🔬 AtomCraft v4.0")
-    st.caption("Universal Nano-Material Property Designer")
-    user_input = st.text_input("Chemical Formula", value="AuCl")
-    iso_val = st.slider(
-        "Electron Cloud Density", 0.01, 0.50, 0.12,
-        help="Isosurface threshold for a synthetic electron-density cloud "
-             "built from each atom's valence-electron count and radius "
-             "(no real DFT data in heuristic mode). Higher = surface "
-             "contracts toward dense atom cores. Lower = surface expands "
-             "into a larger diffuse cloud."
-    )
-    st.info("Universal Prediction Mode — heuristic van Arkel–Ketelaar engine\n\n(element-accurate sphere sizing)")
-
-# ==========================================
-# 5. COMPUTATION
-# ==========================================
-comp = parse_formula(user_input)
-
-if comp:
-    v_list = list(comp.values())
-    total_n = sum(v['n'] for v in v_list)
-    all_chi = [v['chi'] for v in v_list]
-    delta_chi = max(all_chi) - min(all_chi)
-    avg_chi = sum(v['chi'] * v['n'] for v in v_list) / total_n
-    avg_rad = sum(v['rad'] * v['n'] for v in v_list) / total_n
-
-    analysis = van_arkel_analysis(avg_chi, delta_chi, symbols=list(comp.keys()))
-    b_type = analysis["category"]
-    b_col = CATEGORY_COLORS[b_type]
-
+def is_molecule_heuristic(comp):
+    """Shared definition of 'looks like a discrete small molecule' used by
+    both the 3D geometry builder and the reaction-thermodynamics phase
+    guesser, so the two stay consistent with each other."""
     counts = {sym: v['n'] for sym, v in comp.items()}
     total_atoms = sum(counts.values())
     hub_candidates = [s for s, n in counts.items() if n == 1]
+    return bool(hub_candidates) and total_atoms <= 12 and len(comp) >= 2
 
-    def hub_score(s):
-        return (s == "H") + (s == "O") * 0.5
-    hub_candidates_sorted = sorted(hub_candidates, key=hub_score)
-    # BUG FIXED: a single-element formula (e.g. "Cu", "C") trivially has one
-    # "hub candidate" with zero ligands, which used to render as one lonely
-    # floating atom instead of falling through to the lattice branch.
-    is_molecule = bool(hub_candidates_sorted) and total_atoms <= 12 and len(comp) >= 2
 
-    bg = estimate_band_gap(b_type, delta_chi)
-    mech = estimate_mechanical(analysis, avg_rad)
-    # BUG FIXED: melting estimate no longer trusts the geometry-only
-    # is_molecule flag whenever the bonding analysis says Ionic/Metallic/
-    # Covalent Network — those are extended-structure categories by
-    # definition (e.g. GaAs and MoS2 trivially satisfy the "hub + few
-    # ligands" geometry pattern but are real covalent-network semiconductors,
-    # not discrete weakly-bound molecules; they were wrongly coming back as
-    # "Low" melting). The molecular/weak-intermolecular framing now only
-    # applies to "Polar Covalent" — the one category that actually covers
-    # discrete small molecules like H2O, CO2, NH3, CO in this model.
-    melt_is_molecule = is_molecule and b_type == "Polar Covalent"
-    melt_label, melt_desc = estimate_melting(b_type, melt_is_molecule)
+# ==========================================
+# 3.5 GEOMETRY + 3D RENDERING (shared by both modes)
+# ==========================================
+def build_geometry(comp, max_render_atoms=60):
+    """Returns (atom_lines, total_atoms, rendered_atom_count, is_molecule).
+    Two heuristic templates: a hub-and-ligand layout for small discrete
+    molecules (bent/trigonal/spherical-spread depending on ligand count),
+    and an interleaved cubic lattice — SIZED TO THE REAL ATOM COUNT, not a
+    fixed 8 corners — for extended ionic/network/metallic structures."""
+    counts = {sym: v['n'] for sym, v in comp.items()}
+    total_atoms = sum(counts.values())
+    if total_atoms == 0:
+        return [], 0, 0, False
 
-    c1, c2 = st.columns([2, 1])
+    is_molecule = is_molecule_heuristic(comp)
+    atom_lines = []
 
-    # ======================= CENTER: 3D LATTICE =======================
-    with c1:
-        st.subheader(f"Molecular Lattice: {user_input}")
+    if is_molecule:
+        hub_candidates = [s for s, n in counts.items() if n == 1]
 
-        atom_lines = []
-        if is_molecule:
-            hub = hub_candidates_sorted[0]
-            expanded = [s for s, n in counts.items() for _ in range(n)]
-            others = expanded.copy()
-            others.remove(hub)
-            bond_len = 1.1
+        def hub_score(s):
+            return (s == "H") + (s == "O") * 0.5
+        hub = sorted(hub_candidates, key=hub_score)[0]
+        expanded = [s for s, n in counts.items() for _ in range(n)]
+        others = expanded.copy()
+        others.remove(hub)
+        bond_len = 1.1
 
-            atom_lines.append(f"{hub} 0.00 0.00 0.00")
-            n_others = len(others)
-            if n_others == 1:
-                atom_lines.append(f"{others[0]} {bond_len:.2f} 0.00 0.00")
-            elif n_others == 2:
-                half_angle = np.radians(104.5 / 2)
-                dx, dy = bond_len * np.cos(half_angle), bond_len * np.sin(half_angle)
-                atom_lines.append(f"{others[0]} {dx:.2f} {dy:.2f} 0.00")
-                atom_lines.append(f"{others[1]} {dx:.2f} {-dy:.2f} 0.00")
-            else:
-                golden_angle = np.pi * (3 - np.sqrt(5))
-                for i, sym2 in enumerate(others):
-                    y = 1 - (i / float(n_others - 1)) * 2 if n_others > 1 else 0
-                    r = np.sqrt(max(0.0, 1 - y * y))
-                    theta = golden_angle * i
-                    x, z = np.cos(theta) * r, np.sin(theta) * r
-                    atom_lines.append(f"{sym2} {bond_len*x:.2f} {bond_len*y:.2f} {bond_len*z:.2f}")
+        atom_lines.append(f"{hub} 0.00 0.00 0.00")
+        n_others = len(others)
+        if n_others == 1:
+            atom_lines.append(f"{others[0]} {bond_len:.2f} 0.00 0.00")
+        elif n_others == 2:
+            half_angle = np.radians(104.5 / 2)
+            dx, dy = bond_len * np.cos(half_angle), bond_len * np.sin(half_angle)
+            atom_lines.append(f"{others[0]} {dx:.2f} {dy:.2f} 0.00")
+            atom_lines.append(f"{others[1]} {dx:.2f} {-dy:.2f} 0.00")
         else:
-            buckets = {sym: [sym] * n for sym, n in counts.items()}
-            interleaved = []
-            while any(buckets.values()):
-                for sym in list(buckets.keys()):
-                    if buckets[sym]:
-                        interleaved.append(buckets[sym].pop(0))
+            golden_angle = np.pi * (3 - np.sqrt(5))
+            for i, sym2 in enumerate(others):
+                y = 1 - (i / float(n_others - 1)) * 2 if n_others > 1 else 0
+                r = np.sqrt(max(0.0, 1 - y * y))
+                theta = golden_angle * i
+                x, z = np.cos(theta) * r, np.sin(theta) * r
+                atom_lines.append(f"{sym2} {bond_len*x:.2f} {bond_len*y:.2f} {bond_len*z:.2f}")
+        rendered_n = len(atom_lines)
+    else:
+        buckets = {sym: [sym] * n for sym, n in counts.items()}
+        interleaved = []
+        while any(buckets.values()):
+            for sym in list(buckets.keys()):
+                if buckets[sym]:
+                    interleaved.append(buckets[sym].pop(0))
 
-            MAX_RENDER_ATOMS = 60
-            render_n = min(total_atoms, MAX_RENDER_ATOMS)
-            if total_atoms > MAX_RENDER_ATOMS:
-                st.caption(f"⚠️ Rendering {render_n} of {total_atoms} atoms for performance/clarity.")
-            interleaved = interleaved[:render_n]
+        render_n = min(total_atoms, max_render_atoms)
+        interleaved = interleaved[:render_n]
 
-            spacing = 2.5
-            dim = max(2, int(np.ceil(render_n ** (1 / 3))))
-            grid_positions = []
-            for x in range(dim):
-                for y in range(dim):
-                    for z in range(dim):
-                        grid_positions.append((x * spacing, y * spacing, z * spacing))
-                        if len(grid_positions) >= render_n:
-                            break
+        spacing = 2.5
+        dim = max(2, int(np.ceil(render_n ** (1 / 3))))
+        grid_positions = []
+        for x in range(dim):
+            for y in range(dim):
+                for z in range(dim):
+                    grid_positions.append((x * spacing, y * spacing, z * spacing))
                     if len(grid_positions) >= render_n:
                         break
                 if len(grid_positions) >= render_n:
                     break
+            if len(grid_positions) >= render_n:
+                break
 
-            for sym, (x, y, z) in zip(interleaved, grid_positions):
-                atom_lines.append(f"{sym} {x:.2f} {y:.2f} {z:.2f}")
+        for sym, (x, y, z) in zip(interleaved, grid_positions):
+            atom_lines.append(f"{sym} {x:.2f} {y:.2f} {z:.2f}")
+        rendered_n = render_n
 
-        xyz = f"{len(atom_lines)}\nAtomCraft v4.0\n" + "\n".join(atom_lines)
+    return atom_lines, total_atoms, rendered_n, is_molecule
 
-        # BUG FIXED (sizing accuracy): the previous version used ONE fixed
-        # sphere radius for every element, so e.g. Au and Cl rendered
-        # identically sized despite real covalent radii of 1.44 vs 0.99 A.
-        # Each element now gets its own scaled sphere radius (scale=0.45,
-        # clamped to keep tiny/huge atoms visually sane in a ball-and-stick
-        # view) so relative atomic size is genuinely informative.
-        radius_map = {
-            sym: round(max(0.28, min(0.85, v['rad'] * 0.45)), 3)
-            for sym, v in comp.items()
-        }
-        radius_map_json = json.dumps(radius_map)
 
-        # BUG FIXED (Electron Cloud Density was a no-op): checked the real
-        # 3Dmol.js source — addSurface's 'scale' option is ONLY consumed
-        # when real volumetric (voldata) data is supplied for CUBE/VASP
-        # parsing; for a plain position-based VDW surface (our previous
-        # approach) it is silently ignored entirely, so the slider was
-        # computing a new value every rerun that nothing downstream ever
-        # read. There's no real DFT density grid available in heuristic
-        # Universal Mode, so we synthesize one: a sum-of-Gaussians electron
-        # density built from each atom's actual valence-electron count and
-        # covalent radius, then feed it through 3Dmol's real isosurface
-        # threshold mechanism (addIsosurface + isoval) — confirmed from
-        # source: voxels with density > isoval are "inside"; raising isoval
-        # genuinely contracts the surface toward atom cores, lowering it
-        # genuinely expands the surface, exactly matching the original spec.
-        # PRODUCTION NOTE: swap this synthetic grid for a real DFT-computed
-        # charge-density cube file in Live API Mode.
-        atoms_for_density = [
-            {"x": x, "y": y, "z": z,
-             "w": float(comp[sym]['valence']),
-             "sigma": max(0.45, comp[sym]['rad'] * 0.55)}
-            for line in atom_lines
-            for sym, x, y, z in [(lambda p: (p[0], float(p[1]), float(p[2]), float(p[3])))(line.split())]
-        ]
-        atoms_for_density_json = json.dumps(atoms_for_density)
+def build_radius_map(comp):
+    """Per-element visual sphere radius scaled from real covalent radii —
+    fixes the classic bug of every atom rendering the same size regardless
+    of element (e.g. Au vs Cl looking identical)."""
+    return {sym: round(max(0.28, min(0.85, v['rad'] * 0.45)), 3) for sym, v in comp.items()}
 
-        html_3d = f"""
-        <div id="viewer3d" style="height: 500px; width: 100%; background-color: #0b0e14; border-radius: 10px;"></div>
-        <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
-        <script>
-            (function() {{
-                let element = document.getElementById('viewer3d');
-                let viewer = $3Dmol.createViewer(element, {{ backgroundColor: '0x0b0e14' }});
 
-                let xyzData = `{xyz}`;
-                viewer.addModel(xyzData, "xyz");
+def build_density_atoms(atom_lines, comp):
+    """Per-atom (position, valence weight, gaussian width) used to
+    synthesize a fake electron-density grid for the isosurface — see
+    render_3dmol_html for why this exists instead of a no-op 'scale'."""
+    atoms = []
+    for line in atom_lines:
+        parts = line.split()
+        sym, x, y, z = parts[0], float(parts[1]), float(parts[2]), float(parts[3])
+        atoms.append({
+            "x": x, "y": y, "z": z,
+            "w": float(comp[sym]['valence']),
+            "sigma": max(0.45, comp[sym]['rad'] * 0.55),
+        })
+    return atoms
 
-                viewer.setStyle({{}}, {{ stick: {{ radius: 0.12, color: 'grey' }} }});
 
-                let radiusMap = {radius_map_json};
-                Object.keys(radiusMap).forEach(function(sym) {{
-                    viewer.setStyle({{elem: sym}}, {{
-                        sphere: {{ radius: radiusMap[sym], colorscheme: 'Jmol' }},
-                        stick: {{ radius: 0.12, color: 'grey' }}
-                    }});
+def render_3dmol_html(div_id, xyz, radius_map, atoms_for_density, b_col, iso_val, height=520):
+    """Renders one independent 3Dmol viewer. Each call uses its OWN unique
+    div id and its own explicit $3Dmol.createViewer(...) call (rather than
+    the fragile 'viewer_3Dmoljs' auto-init class + indexing into
+    $3Dmol.viewers[0]/[1] by registration order) — this is what makes
+    placing two independent viewers side-by-side (Reaction Design
+    Dashboard) safe: there's no shared global registry to race against.
+
+    Electron Cloud Density: there's no real DFT density grid in heuristic
+    mode, so we synthesize one (sum-of-Gaussians from each atom's actual
+    valence-electron count + covalent radius) and feed it through 3Dmol's
+    REAL isosurface threshold mechanism (addIsosurface + isoval, confirmed
+    against the library source) rather than the no-op addSurface 'scale'
+    parameter, which is silently ignored for non-volumetric surfaces.
+    PRODUCTION NOTE: swap this synthetic grid for a real DFT-computed
+    charge-density cube file in Live API Mode.
+    """
+    radius_map_json = json.dumps(radius_map)
+    atoms_for_density_json = json.dumps(atoms_for_density)
+    return f"""
+    <div id="{div_id}" style="height: {height}px; width: 100%; background-color: #0b0e14; border-radius: 10px;"></div>
+    <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+    <script>
+        (function() {{
+            let element = document.getElementById('{div_id}');
+            let viewer = $3Dmol.createViewer(element, {{ backgroundColor: '0x0b0e14' }});
+
+            let xyzData = `{xyz}`;
+            viewer.addModel(xyzData, "xyz");
+
+            viewer.setStyle({{}}, {{ stick: {{ radius: 0.12, color: 'grey' }} }});
+
+            let radiusMap = {radius_map_json};
+            Object.keys(radiusMap).forEach(function(sym) {{
+                viewer.setStyle({{elem: sym}}, {{
+                    sphere: {{ radius: radiusMap[sym], colorscheme: 'Jmol' }},
+                    stick: {{ radius: 0.12, color: 'grey' }}
                 }});
+            }});
 
-                // ---- Synthesize a Gaussian-sum electron density grid ----
-                let atoms = {atoms_for_density_json};
+            let atoms = {atoms_for_density_json};
+            if (atoms.length > 0) {{
                 let pad = 2.5;
                 let xs = atoms.map(a => a.x), ys = atoms.map(a => a.y), zs = atoms.map(a => a.z);
                 let minX = Math.min(...xs) - pad, maxX = Math.max(...xs) + pad;
                 let minY = Math.min(...ys) - pad, maxY = Math.max(...ys) + pad;
                 let minZ = Math.min(...zs) - pad, maxZ = Math.max(...zs) + pad;
-                let N = 28;
+                let N = 26;
                 let dx = (maxX - minX) / (N - 1), dy = (maxY - minY) / (N - 1), dz = (maxZ - minZ) / (N - 1);
                 let data = new Float32Array(N * N * N);
                 let maxRho = 1e-6;
@@ -611,13 +520,6 @@ if comp:
                 voldata.data = data;
                 voldata.matrix = null;
 
-                // Map the slider (0.01-0.50) onto a FRACTION of this specific
-                // structure's own peak density, rather than an absolute
-                // threshold — guarantees the surface meaningfully contracts
-                // (toward 85% of peak) and expands (down to 5% of peak) across
-                // the full slider range regardless of which elements/how many
-                // atoms are present, instead of depending on fixed constants
-                // happening to land in the right absolute range every time.
                 let frac = ({iso_val} - 0.01) / (0.50 - 0.01);
                 let isoval = maxRho * (0.05 + frac * 0.80);
 
@@ -627,117 +529,638 @@ if comp:
                     opacity: 0.45,
                     smoothness: 1
                 }});
+            }}
 
-                viewer.zoomTo();
-                viewer.render();
+            viewer.zoomTo();
+            viewer.render();
 
-                window.addEventListener('resize', function() {{
-                    viewer.resize();
-                }});
-            }})();
-        </script>
-        """
-        st.iframe(html_3d, height=520)
+            window.addEventListener('resize', function() {{
+                viewer.resize();
+            }});
+        }})();
+    </script>
+    """
 
-    # ======================= RIGHT: TELEMETRY =======================
-    with c2:
-        st.subheader("Analysis")
-        m1, m2 = st.columns(2)
-        m1.metric("Mean χ", f"{avg_chi:.2f}")
-        m2.metric("Δχ", f"{delta_chi:.2f}")
-        m3, m4 = st.columns(2)
-        m3.metric("Avg Radius", f"{avg_rad:.2f} Å")
-        m4.metric("Bond Type", b_type)
 
-        tab_bond, tab_band, tab_mech, tab_comp = st.tabs(
-            ["Bonding", "Band Structure", "Mechanical", "Composition"]
+# ==========================================
+# 4. REACTION DESIGN ENGINE (Thermodynamics)
+# ==========================================
+# Reference standard enthalpies of formation (kJ/mol, approximate literature
+# values, simplest-ratio formula unit). PRODUCTION NOTE: swap for a live
+# NIST-JANAF / Materials Project formation-energy lookup for citation-grade
+# numbers. Anything not in this table falls back to a transparent bonding-
+# character heuristic (see estimate_formation_enthalpy).
+RAW_HF_TABLE = {
+    "H2O": -285.8, "CO2": -393.5, "NH3": -45.9, "CH4": -74.8,
+    "NaCl": -411.2, "KCl": -436.5, "MgCl2": -641.3, "CaCl2": -795.8,
+    "AgCl": -127.0, "HCl": -92.3, "HF": -273.3, "HBr": -36.3, "HI": 26.5,
+    "TiO2": -944.0, "Al2O3": -1675.7, "Fe2O3": -824.2, "Fe3O4": -1118.4,
+    "CaO": -635.1, "MgO": -601.6, "SiO2": -910.7, "CuO": -157.3,
+    "Cu2O": -168.6, "ZnO": -350.5, "NiO": -239.7, "PbO": -217.3,
+    "ZrO2": -1100.6, "Cr2O3": -1139.7, "MnO2": -520.0, "WO3": -842.9,
+    "V2O5": -1550.6, "Ga2O3": -1089.1, "Li2O": -597.9, "Na2O": -414.2,
+    "K2O": -363.2, "BaO": -548.1, "SrO": -590.8, "B2O3": -1273.5,
+    "CaCO3": -1206.9, "SO2": -296.8, "SO3": -395.7, "NO": 90.3,
+    "NO2": 33.2, "N2O": 82.0, "H2S": -20.6, "PCl3": -319.7, "P4O10": -2984.0,
+    "CCl4": -135.4, "CS2": 89.0, "C2H2": 227.4, "C2H4": 52.4, "C2H6": -84.7,
+    "C6H6": 49.0, "SiC": -65.3, "TiC": -184.5, "WC": -38.0, "GaAs": -78.0,
+}
+
+
+def _normalize_comp(comp):
+    """Reduces a parsed composition to its simplest integer ratio and a
+    canonical sorted key, so e.g. 'Fe4O6' and 'Fe2O3' both hit the same
+    reference-table entry (then get rescaled back up by the same factor)."""
+    counts = {sym: v['n'] for sym, v in comp.items()}
+    g = functools.reduce(math.gcd, counts.values())
+    g = g if g else 1
+    reduced = {sym: n // g for sym, n in counts.items()}
+    return tuple(sorted(reduced.items())), g
+
+
+_NORMALIZED_HF = {}
+for _f, _val in RAW_HF_TABLE.items():
+    _c = parse_formula(_f)
+    _key, _ = _normalize_comp(_c)
+    _NORMALIZED_HF[_key] = _val
+
+
+def estimate_formation_enthalpy(comp):
+    """Returns (delta_Hf kJ/mol-per-formula-unit-as-written, source_label).
+
+    BUG FIXED relative to the originally-pasted draft: that version assigned
+    non-zero 'enthalpies' to pure elements (e.g. Cu: -157 kJ/mol — that's
+    actually close to Cu2O's real value, suggesting a copy/paste mismatch
+    between an element row and a compound's data). By definition, an
+    element in its standard state has Hf == 0; that's not a heuristic
+    shortcut, it IS the thermodynamic reference convention every other
+    value is measured relative to."""
+    if len(comp) == 1:
+        return 0.0, "standard state (ΔHf ≡ 0 by definition)"
+
+    key, g = _normalize_comp(comp)
+    if key in _NORMALIZED_HF:
+        return _NORMALIZED_HF[key] * g, "known reference value"
+
+    # Heuristic fallback: more ionic/covalent bonding character and more
+    # atoms per formula unit -> more exothermic formation, scaled by however
+    # many "reduced formula units" the typed formula actually represents.
+    all_chi = [v['chi'] for v in comp.values()]
+    delta_chi = max(all_chi) - min(all_chi)
+    total_n = sum(v['n'] for v in comp.values())
+    avg_chi = sum(v['chi'] * v['n'] for v in comp.values()) / total_n
+    analysis = van_arkel_analysis(avg_chi, delta_chi, symbols=list(comp.keys()))
+    ionic_frac = analysis["ionic_character"] / 100
+    covalent_frac = analysis["covalent_pct"] / 100
+
+    counts = {sym: v['n'] for sym, v in comp.items()}
+    reduced_atoms = sum(n // g for n in counts.values())
+    per_bond = -(60 + 220 * ionic_frac + 90 * covalent_frac)
+    hf = per_bond * max(0, reduced_atoms - 1) * g
+    return max(-4000.0, min(50.0, hf)), "heuristic estimate (no reference data)"
+
+
+def guess_phase(comp, is_molecule):
+    """Simplified STP phase guess used only to pick a representative
+    standard molar entropy. Real phase determination needs an actual
+    phase diagram; this is a coarse heuristic, not a melting/boiling-point
+    calculation."""
+    syms = set(comp.keys())
+    if len(syms) == 1:
+        sym = next(iter(syms))
+        return "gas" if sym in {"H", "N", "O", "F", "Cl"} else "solid"
+    nonmetal_only = syms.issubset({"H", "C", "N", "O", "F", "P", "S", "Cl", "Br", "I"})
+    return "gas" if (nonmetal_only and is_molecule) else "solid"
+
+
+def estimate_standard_entropy(comp, is_molecule):
+    """Rough S° (J/mol·K) by phase guess, scaled gently by atom count
+    (more atoms -> more vibrational/rotational modes -> more entropy).
+    Calibrated loosely against real S° ranges: gases ~130-260,
+    solid elements ~25-35, solid compounds ~40-160."""
+    phase = guess_phase(comp, is_molecule)
+    total_atoms = sum(v['n'] for v in comp.values())
+    if phase == "gas":
+        s = min(260.0, 130 + 12 * total_atoms)
+    else:
+        s = 30.0 if len(comp) == 1 else min(160.0, 40 + 9 * total_atoms)
+    return s, phase
+
+
+R_KJ = 0.0083145  # kJ/(mol*K)
+
+
+def parse_equation(eqn):
+    """Splits 'aA + bB -> cC + dD' into coefficient/formula pairs on each
+    side. Coefficient parsing is regex-anchored on leading digits only
+    (unlike a naive '[A-Za-z0-9]*' formula match), so it stays correct for
+    formulas containing parentheses/hydrates, e.g. '3Ca(OH)2 -> ...'."""
+    eqn = eqn.strip()
+    eqn = eqn.replace("\u2192", "->")
+    if "->" not in eqn and "=" in eqn:
+        eqn = eqn.replace("=", "->", 1)
+    if "->" not in eqn:
+        return None, None, "Equation must contain '->' separating reactants and products."
+    parts = eqn.split("->")
+    if len(parts) != 2:
+        return None, None, "Equation must contain exactly one '->'."
+
+    def process_side(raw):
+        species = []
+        for item in raw.split("+"):
+            item = item.strip()
+            if not item:
+                continue
+            m = re.match(r'^(\d*)\s*(.*)$', item)
+            coeff = int(m.group(1)) if m.group(1) else 1
+            formula_str = m.group(2).strip()
+            if not formula_str:
+                continue
+            comp = parse_formula(formula_str)
+            if not comp:
+                continue
+            species.append({"coeff": coeff, "formula": formula_str, "comp": comp})
+        return species
+
+    reactants = process_side(parts[0])
+    products = process_side(parts[1])
+    if not reactants or not products:
+        return None, None, "Could not parse one or both sides of the equation."
+    return reactants, products, None
+
+
+def check_atom_balance(reactants, products):
+    from collections import Counter
+    rc, pc = Counter(), Counter()
+    for r in reactants:
+        for sym, v in r["comp"].items():
+            rc[sym] += v["n"] * r["coeff"]
+    for p in products:
+        for sym, v in p["comp"].items():
+            pc[sym] += v["n"] * p["coeff"]
+    return rc, pc, (rc == pc)
+
+
+def compute_reaction_thermo(reactants, products, temp_k, pressure_atm):
+    """Hess's-law ΔH, phase-weighted ΔS, and ΔG = ΔH - TΔS + a pressure
+    correction term that only kicks in when the reaction's gas-phase mole
+    count actually changes: ΔG_pressure = Δn_gas · R · T · ln(P). This is
+    the real ideal-gas free-energy dependence on pressure (mu(P) = mu° +
+    RT ln(P/P°)) summed over the net change in gas moles — e.g. for the
+    Haber process (N2 + 3H2 -> 2NH3, Δn_gas = -2), this correctly predicts
+    that HIGHER pressure favors ammonia formation (lowers ΔG), matching the
+    real-world reason industrial ammonia synthesis runs at high pressure.
+
+    BUG FIXED relative to the originally-pasted draft: that version created
+    a 'pressure' slider that was never referenced anywhere in the ΔG
+    calculation — a dead control, identical in spirit to the earlier
+    Electron Cloud Density slider bug. It's also fixed for ΔS, which used a
+    single hardcoded constant (-0.15 kJ/mol·K) for every reaction regardless
+    of what was actually typed; ΔS here is now derived per-species from a
+    phase-aware entropy estimate, so it actually changes per reaction."""
+    h_react = h_prod = 0.0
+    s_react = s_prod = 0.0
+    gas_mol_react = gas_mol_prod = 0.0
+
+    for r in reactants:
+        hf, src = estimate_formation_enthalpy(r["comp"])
+        s, phase = estimate_standard_entropy(r["comp"], is_molecule_heuristic(r["comp"]))
+        r["hf"], r["hf_source"], r["s"], r["phase"] = hf, src, s, phase
+        h_react += r["coeff"] * hf
+        s_react += r["coeff"] * s
+        if phase == "gas":
+            gas_mol_react += r["coeff"]
+
+    for p in products:
+        hf, src = estimate_formation_enthalpy(p["comp"])
+        s, phase = estimate_standard_entropy(p["comp"], is_molecule_heuristic(p["comp"]))
+        p["hf"], p["hf_source"], p["s"], p["phase"] = hf, src, s, phase
+        h_prod += p["coeff"] * hf
+        s_prod += p["coeff"] * s
+        if phase == "gas":
+            gas_mol_prod += p["coeff"]
+
+    delta_h = h_prod - h_react
+    delta_s_j = s_prod - s_react          # J/mol*K
+    delta_s_kj = delta_s_j / 1000.0       # kJ/mol*K
+    delta_n_gas = gas_mol_prod - gas_mol_react
+    pressure_term = delta_n_gas * R_KJ * temp_k * math.log(max(pressure_atm, 1e-6))
+    delta_g = delta_h - temp_k * delta_s_kj + pressure_term
+
+    return {
+        "delta_h": delta_h, "delta_s_j": delta_s_j, "delta_g": delta_g,
+        "delta_n_gas": delta_n_gas, "pressure_term": pressure_term,
+        "spontaneous": delta_g < 0,
+    }
+
+
+def combined_composition(species_list):
+    """Sums atom counts across every species on one side of an equation
+    (weighted by stoichiometric coefficient) into one composition dict, for
+    a single combined before/after 3D snapshot of that side of the
+    reaction."""
+    counts = {}
+    for sp in species_list:
+        for sym, v in sp["comp"].items():
+            counts[sym] = counts.get(sym, 0) + v["n"] * sp["coeff"]
+    combined = {}
+    for sym, n in counts.items():
+        d = get_el_data(sym)
+        combined[sym] = {
+            "n": n, "chi": d["chi"], "rad": d["radius"], "col": d["color"],
+            "group": d["group"], "block": d["block"], "valence": d["valence"],
+        }
+    return combined
+
+
+def bonding_color_for(comp):
+    v_list = list(comp.values())
+    total_n = sum(v["n"] for v in v_list)
+    all_chi = [v["chi"] for v in v_list]
+    delta_chi = max(all_chi) - min(all_chi)
+    avg_chi = sum(v["chi"] * v["n"] for v in v_list) / total_n
+    analysis = van_arkel_analysis(avg_chi, delta_chi, symbols=list(comp.keys()))
+    return CATEGORY_COLORS[analysis["category"]], analysis
+
+
+# ==========================================
+# 5. APP CONFIGURATION & THEME
+# ==========================================
+st.set_page_config(page_title="AtomCraft v4.1", layout="wide")
+st.markdown("""
+<style>
+/* Base app background + default text color */
+html, body, .main, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+    background-color: #0d1117 !important;
+    color: #e6edf3 !important;
+}
+[data-testid="stHeader"] { background-color: rgba(0,0,0,0) !important; }
+
+/* Headings / body text everywhere */
+h1, h2, h3, h4, h5, h6 { color: #f0f6fc !important; }
+.main p, .main span, .main label, .main li { color: #c9d1d9; }
+
+/* Sidebar */
+section[data-testid="stSidebar"] {
+    background-color: #11161d !important;
+    border-right: 1px solid #21262d;
+}
+section[data-testid="stSidebar"] * { color: #e6edf3 !important; }
+section[data-testid="stSidebar"] input {
+    background-color: #0d1117 !important;
+    color: #f0f6fc !important;
+    border: 1px solid #30363d !important;
+}
+
+/* Captions */
+[data-testid="stCaptionContainer"], .main small { color: #9aa4b2 !important; }
+
+/* Widget labels */
+[data-testid="stWidgetLabel"] p { color: #c9d1d9 !important; font-weight: 500; }
+
+/* st.info / st.warning / st.error / st.success boxes */
+[data-testid="stAlert"] * { color: #e6edf3 !important; }
+
+/* Metric cards */
+div[data-testid="stMetric"] {
+    background: #161b22 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 10px; padding: 12px;
+}
+[data-testid="stMetricLabel"] p { color: #8b949e !important; }
+div[data-testid="stMetricValue"] {
+    color: #f0f6fc !important;
+    font-size: 1.25rem !important;
+    white-space: normal !important;
+    overflow: visible !important;
+    text-overflow: unset !important;
+    line-height: 1.25 !important;
+}
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] { gap: 4px; }
+.stTabs [data-baseweb="tab"] p { color: #8b949e !important; }
+.stTabs [aria-selected="true"] p { color: #f0f6fc !important; }
+
+/* Dataframe */
+[data-testid="stDataFrame"] { color: #e6edf3 !important; }
+
+/* Radio (mode toggle) styled closer to a segmented control */
+div[role="radiogroup"] { gap: 4px; }
+</style>
+""", unsafe_allow_html=True)
+
+with st.sidebar:
+    st.title("🔬 AtomCraft v4.1")
+    st.caption("Universal Nano-Material Property Designer")
+    mode = st.radio(
+        "Mode",
+        ["Material Property Inspector", "Reaction Design Dashboard"],
+        help="Inspector analyzes one formula's bonding/structure. Dashboard "
+             "analyzes a full reaction's thermodynamics and synthesis path."
+    )
+    st.markdown("---")
+
+    if mode == "Material Property Inspector":
+        user_input = st.text_input("Chemical Formula", value="AuCl")
+    else:
+        eqn_input = st.text_input(
+            "Chemical Equation", value="Ti + O2 -> TiO2",
+            help="Use '+' between species and '->' to separate reactants "
+                 "from products, e.g. '2H2 + O2 -> 2H2O'. Coefficients are "
+                 "used as typed — equations are not auto-balanced."
         )
 
-        with tab_bond:
-            corners = analysis["corners"]
-            xs = [corners["Metallic"][0], corners["Covalent"][0], corners["Ionic"][0], corners["Metallic"][0]]
-            ys = [corners["Metallic"][1], corners["Covalent"][1], corners["Ionic"][1], corners["Metallic"][1]]
-            fig_tri = go.Figure()
-            fig_tri.add_trace(go.Scatter(x=xs, y=ys, mode="lines",
-                                          line=dict(color="#444", width=1), showlegend=False))
-            for label, (cx, cy) in corners.items():
-                fig_tri.add_trace(go.Scatter(x=[cx], y=[cy], mode="markers+text", text=[label],
-                                              textposition="bottom center", textfont=dict(color="#aab4c0"),
-                                              marker=dict(size=6, color="#666"), showlegend=False))
-            fig_tri.add_trace(go.Scatter(x=[avg_chi], y=[delta_chi], mode="markers",
-                                          marker=dict(size=16, color=b_col, line=dict(width=2, color="white")),
-                                          showlegend=False))
-            fig_tri.update_layout(
-                height=280, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#e6edf3"), margin=dict(t=20, b=20, l=20, r=20),
-                xaxis=dict(title="Mean χ", range=[0.5, 3.2], gridcolor="#21262d", tickfont=dict(color="#e6edf3")),
-                yaxis=dict(title="Δχ (ionic axis)", range=[-0.3, 3.6], gridcolor="#21262d", tickfont=dict(color="#e6edf3")),
-            )
-            st.plotly_chart(fig_tri, theme=None)
-            st.caption(
-                f"Metallic {analysis['metallic_pct']:.0f}% · Covalent {analysis['covalent_pct']:.0f}% · "
-                f"Ionic {analysis['ionic_pct']:.0f}% (Pauling ionic character: {analysis['ionic_character']:.0f}%)"
-            )
-            st.markdown(f"**Estimated melting profile: {melt_label}**")
-            st.caption(melt_desc)
+    iso_val = st.slider(
+        "Electron Cloud Density", 0.01, 0.50, 0.12,
+        help="Isosurface threshold for a synthetic electron-density cloud "
+             "built from each atom's valence-electron count and radius "
+             "(no real DFT data in heuristic mode). Higher = surface "
+             "contracts toward dense atom cores. Lower = surface expands "
+             "into a larger diffuse cloud."
+    )
 
-        with tab_band:
-            fig_band = go.Figure()
-            if b_type == "Metallic" or bg <= 0.05:
-                fig_band.add_shape(type="rect", x0=0, x1=1, y0=-2, y1=1,
-                                    fillcolor=b_col, opacity=0.5, line=dict(width=0))
-                fig_band.add_annotation(x=0.5, y=-0.5, text="Overlapping Bands<br>(Conductor)",
-                                         showarrow=False, font=dict(color="white"))
-                y_range = [-2.5, 2]
-            else:
-                fig_band.add_shape(type="rect", x0=0, x1=1, y0=-2, y1=0,
-                                    fillcolor="#58a6ff", opacity=0.6, line=dict(width=0))
-                fig_band.add_shape(type="rect", x0=0, x1=1, y0=bg, y1=bg + 2,
-                                    fillcolor="#ff8000", opacity=0.6, line=dict(width=0))
-                fig_band.add_annotation(x=0.5, y=-1, text="Valence Band", showarrow=False, font=dict(color="white"))
-                fig_band.add_annotation(x=0.5, y=bg + 1, text="Conduction Band", showarrow=False, font=dict(color="white"))
-                fig_band.add_annotation(x=1.25, y=bg / 2, text=f"Eg = {bg:.2f} eV",
-                                         showarrow=False, font=dict(color=b_col, size=14))
-                y_range = [-2.5, max(bg + 2.5, 3)]
-            fig_band.update_layout(
-                height=300, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#e6edf3"),
-                xaxis=dict(visible=False, range=[-0.3, 1.7]),
-                yaxis=dict(title="Energy (eV, relative)", range=y_range, gridcolor="#21262d",
-                           color="#e6edf3", tickfont=dict(color="#e6edf3")),
-                margin=dict(t=20, b=20, l=10, r=10), showlegend=False,
-            )
-            st.plotly_chart(fig_band, theme=None)
-            gap_label = ("Conductor" if (b_type == "Metallic" or bg <= 0.05)
-                         else "Semiconductor" if bg <= 3.0 else "Insulator")
-            st.caption(f"Classification: **{gap_label}** (Eg ≈ {bg:.2f} eV)")
+    if mode == "Material Property Inspector":
+        st.info("Universal Prediction Mode — heuristic van Arkel–Ketelaar engine\n\n(element-accurate sphere sizing)")
+    else:
+        st.info("Reaction Design Dashboard — heuristic ΔH/ΔS/ΔG engine\n\n(known-compound lookup + bonding-based fallback)")
 
-        with tab_mech:
-            cats = list(mech.keys())
-            vals = list(mech.values())
-            fig_radar = go.Figure()
-            fig_radar.add_trace(go.Scatterpolar(
-                r=vals + [vals[0]], theta=cats + [cats[0]], fill="toself",
-                line=dict(color=b_col), fillcolor=b_col, opacity=0.5,
-            ))
-            fig_radar.update_layout(
-                polar=dict(bgcolor="rgba(0,0,0,0)",
-                           radialaxis=dict(visible=True, range=[0, 100], color="#e6edf3",
-                                            gridcolor="#21262d", tickfont=dict(color="#e6edf3")),
-                           angularaxis=dict(color="#e6edf3", tickfont=dict(color="#e6edf3"))),
-                showlegend=False, paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e6edf3"),
-                height=320, margin=dict(t=30, b=30, l=30, r=30),
-            )
-            st.plotly_chart(fig_radar, theme=None)
-            st.caption("Heuristic engineering-trait estimate — not a substitute for measured elastic-tensor data.")
+# ==========================================
+# 6A. MATERIAL PROPERTY INSPECTOR
+# ==========================================
+if mode == "Material Property Inspector":
+    comp = parse_formula(user_input)
 
-        with tab_comp:
-            rows = []
-            for k, v in comp.items():
-                rows.append({
-                    "Sym": k, "n": v["n"], "χ": v["chi"], "Radius (Å)": v["rad"],
-                    "Group": v["group"], "Block": v["block"], "Valence e⁻": v["valence"],
-                })
-            st.dataframe(pd.DataFrame(rows), hide_index=True)
+    if comp:
+        v_list = list(comp.values())
+        total_n = sum(v['n'] for v in v_list)
+        all_chi = [v['chi'] for v in v_list]
+        delta_chi = max(all_chi) - min(all_chi)
+        avg_chi = sum(v['chi'] * v['n'] for v in v_list) / total_n
+        avg_rad = sum(v['rad'] * v['n'] for v in v_list) / total_n
+
+        analysis = van_arkel_analysis(avg_chi, delta_chi, symbols=list(comp.keys()))
+        b_type = analysis["category"]
+        b_col = CATEGORY_COLORS[b_type]
+
+        bg = estimate_band_gap(b_type, delta_chi)
+        mech = estimate_mechanical(analysis, avg_rad)
+        is_molecule = is_molecule_heuristic(comp)
+        melt_is_molecule = is_molecule and b_type == "Polar Covalent"
+        melt_label, melt_desc = estimate_melting(b_type, melt_is_molecule)
+
+        c1, c2 = st.columns([2, 1])
+
+        with c1:
+            st.subheader(f"Molecular Lattice: {user_input}")
+            atom_lines, total_atoms, rendered_n, _ = build_geometry(comp)
+            if rendered_n < total_atoms:
+                st.caption(f"⚠️ Rendering {rendered_n} of {total_atoms} atoms for performance/clarity.")
+            xyz = f"{len(atom_lines)}\nAtomCraft v4.1\n" + "\n".join(atom_lines)
+            radius_map = build_radius_map(comp)
+            density_atoms = build_density_atoms(atom_lines, comp)
+            html_3d = render_3dmol_html("viewerMain", xyz, radius_map, density_atoms, b_col, iso_val, height=520)
+            st.iframe(html_3d, height=520)
+
+        with c2:
+            st.subheader("Analysis")
+            m1, m2 = st.columns(2)
+            m1.metric("Mean χ", f"{avg_chi:.2f}")
+            m2.metric("Δχ", f"{delta_chi:.2f}")
+            m3, m4 = st.columns(2)
+            m3.metric("Avg Radius", f"{avg_rad:.2f} Å")
+            m4.metric("Bond Type", b_type)
+
+            tab_bond, tab_band, tab_mech, tab_comp = st.tabs(
+                ["Bonding", "Band Structure", "Mechanical", "Composition"]
+            )
+
+            with tab_bond:
+                corners = analysis["corners"]
+                xs = [corners["Metallic"][0], corners["Covalent"][0], corners["Ionic"][0], corners["Metallic"][0]]
+                ys = [corners["Metallic"][1], corners["Covalent"][1], corners["Ionic"][1], corners["Metallic"][1]]
+                fig_tri = go.Figure()
+                fig_tri.add_trace(go.Scatter(x=xs, y=ys, mode="lines",
+                                              line=dict(color="#444", width=1), showlegend=False))
+                for label, (cx, cy) in corners.items():
+                    fig_tri.add_trace(go.Scatter(x=[cx], y=[cy], mode="markers+text", text=[label],
+                                                  textposition="bottom center", textfont=dict(color="#aab4c0"),
+                                                  marker=dict(size=6, color="#666"), showlegend=False))
+                fig_tri.add_trace(go.Scatter(x=[avg_chi], y=[delta_chi], mode="markers",
+                                              marker=dict(size=16, color=b_col, line=dict(width=2, color="white")),
+                                              showlegend=False))
+                fig_tri.update_layout(
+                    height=280, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#e6edf3"), margin=dict(t=20, b=20, l=20, r=20),
+                    xaxis=dict(title="Mean χ", range=[0.5, 3.2], gridcolor="#21262d", tickfont=dict(color="#e6edf3")),
+                    yaxis=dict(title="Δχ (ionic axis)", range=[-0.3, 3.6], gridcolor="#21262d", tickfont=dict(color="#e6edf3")),
+                )
+                st.plotly_chart(fig_tri, theme=None)
+                st.caption(
+                    f"Metallic {analysis['metallic_pct']:.0f}% · Covalent {analysis['covalent_pct']:.0f}% · "
+                    f"Ionic {analysis['ionic_pct']:.0f}% (Pauling ionic character: {analysis['ionic_character']:.0f}%)"
+                )
+                st.markdown(f"**Estimated melting profile: {melt_label}**")
+                st.caption(melt_desc)
+
+            with tab_band:
+                fig_band = go.Figure()
+                if b_type == "Metallic" or bg <= 0.05:
+                    fig_band.add_shape(type="rect", x0=0, x1=1, y0=-2, y1=1,
+                                        fillcolor=b_col, opacity=0.5, line=dict(width=0))
+                    fig_band.add_annotation(x=0.5, y=-0.5, text="Overlapping Bands<br>(Conductor)",
+                                             showarrow=False, font=dict(color="white"))
+                    y_range = [-2.5, 2]
+                else:
+                    fig_band.add_shape(type="rect", x0=0, x1=1, y0=-2, y1=0,
+                                        fillcolor="#58a6ff", opacity=0.6, line=dict(width=0))
+                    fig_band.add_shape(type="rect", x0=0, x1=1, y0=bg, y1=bg + 2,
+                                        fillcolor="#ff8000", opacity=0.6, line=dict(width=0))
+                    fig_band.add_annotation(x=0.5, y=-1, text="Valence Band", showarrow=False, font=dict(color="white"))
+                    fig_band.add_annotation(x=0.5, y=bg + 1, text="Conduction Band", showarrow=False, font=dict(color="white"))
+                    fig_band.add_annotation(x=1.25, y=bg / 2, text=f"Eg = {bg:.2f} eV",
+                                             showarrow=False, font=dict(color=b_col, size=14))
+                    y_range = [-2.5, max(bg + 2.5, 3)]
+                fig_band.update_layout(
+                    height=300, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#e6edf3"),
+                    xaxis=dict(visible=False, range=[-0.3, 1.7]),
+                    yaxis=dict(title="Energy (eV, relative)", range=y_range, gridcolor="#21262d",
+                               color="#e6edf3", tickfont=dict(color="#e6edf3")),
+                    margin=dict(t=20, b=20, l=10, r=10), showlegend=False,
+                )
+                st.plotly_chart(fig_band, theme=None)
+                gap_label = ("Conductor" if (b_type == "Metallic" or bg <= 0.05)
+                             else "Semiconductor" if bg <= 3.0 else "Insulator")
+                st.caption(f"Classification: **{gap_label}** (Eg ≈ {bg:.2f} eV)")
+
+            with tab_mech:
+                cats = list(mech.keys())
+                vals = list(mech.values())
+                fig_radar = go.Figure()
+                fig_radar.add_trace(go.Scatterpolar(
+                    r=vals + [vals[0]], theta=cats + [cats[0]], fill="toself",
+                    line=dict(color=b_col), fillcolor=b_col, opacity=0.5,
+                ))
+                fig_radar.update_layout(
+                    polar=dict(bgcolor="rgba(0,0,0,0)",
+                               radialaxis=dict(visible=True, range=[0, 100], color="#e6edf3",
+                                                gridcolor="#21262d", tickfont=dict(color="#e6edf3")),
+                               angularaxis=dict(color="#e6edf3", tickfont=dict(color="#e6edf3"))),
+                    showlegend=False, paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e6edf3"),
+                    height=320, margin=dict(t=30, b=30, l=30, r=30),
+                )
+                st.plotly_chart(fig_radar, theme=None)
+                st.caption("Heuristic engineering-trait estimate — not a substitute for measured elastic-tensor data.")
+
+            with tab_comp:
+                rows = []
+                for k, v in comp.items():
+                    rows.append({
+                        "Sym": k, "n": v["n"], "χ": v["chi"], "Radius (Å)": v["rad"],
+                        "Group": v["group"], "Block": v["block"], "Valence e⁻": v["valence"],
+                    })
+                st.dataframe(pd.DataFrame(rows), hide_index=True)
+    else:
+        st.error("Invalid Formula")
+
+# ==========================================
+# 6B. REACTION DESIGN DASHBOARD
+# ==========================================
 else:
-    st.error("Invalid Formula")
+    reactants, products, err = parse_equation(eqn_input)
+
+    if err:
+        st.error(f"{err} Use the format: '2H2 + O2 -> 2H2O'")
+    else:
+        rc, pc, balanced = check_atom_balance(reactants, products)
+        if not balanced:
+            st.warning(
+                f"⚠️ Equation may not be atom-balanced — Reactant atoms: {dict(rc)} "
+                f"vs Product atoms: {dict(pc)}. Calculations below still use the "
+                f"coefficients exactly as typed."
+            )
+
+        c_ctrl, c_viz, c_therm = st.columns([1, 1.6, 1.2])
+
+        with c_ctrl:
+            st.subheader("Reaction Controls")
+            temp = st.slider("Temperature (K)", 100, 3000, 298,
+                              help="Used directly in ΔG = ΔH - TΔS.")
+            pressure = st.slider(
+                "Pressure (atm)", 1, 500, 1,
+                help="Only changes ΔG when the reaction's gas-phase mole "
+                     "count differs between products and reactants "
+                     "(Δn_gas ≠ 0), via ΔG_pressure = Δn_gas · R · T · ln(P) "
+                     "— the real ideal-gas free-energy/pressure relationship."
+            )
+            thermo = compute_reaction_thermo(reactants, products, temp, pressure)
+
+            st.metric("ΔH (reaction)", f"{thermo['delta_h']:.1f} kJ/mol")
+            st.metric("ΔS (reaction)", f"{thermo['delta_s_j']:.1f} J/mol·K")
+            st.metric(f"ΔG @ {temp} K, {pressure} atm", f"{thermo['delta_g']:.1f} kJ/mol")
+
+            if thermo["spontaneous"]:
+                st.success("✅ Spontaneous (ΔG < 0) at these conditions")
+            else:
+                st.error("❌ Non-spontaneous (ΔG > 0) at these conditions")
+
+            reaction_type = "Exothermic (Heat Releasing)" if thermo["delta_h"] < 0 else "Endothermic (Requires Energy Input)"
+            st.markdown(f"**{reaction_type}**")
+
+            if abs(thermo["delta_n_gas"]) > 1e-9:
+                direction = "raises" if thermo["pressure_term"] > 0 else "lowers"
+                st.caption(
+                    f"Δn(gas) = {thermo['delta_n_gas']:+.1f} mol → pressure {direction} "
+                    f"ΔG by {abs(thermo['pressure_term']):.1f} kJ/mol at {pressure} atm."
+                )
+            else:
+                st.caption("No net change in gas-phase moles — pressure has negligible effect on this reaction's ΔG.")
+
+            with st.expander("Per-species thermodynamic data"):
+                rows = []
+                for r in reactants:
+                    rows.append({"Role": "Reactant", "Species": f"{r['coeff']}{r['formula']}",
+                                 "ΔHf (kJ/mol)": round(r["hf"], 1), "S° (J/mol·K)": round(r["s"], 1),
+                                 "Phase (guess)": r["phase"], "Source": r["hf_source"]})
+                for p in products:
+                    rows.append({"Role": "Product", "Species": f"{p['coeff']}{p['formula']}",
+                                 "ΔHf (kJ/mol)": round(p["hf"], 1), "S° (J/mol·K)": round(p["s"], 1),
+                                 "Phase (guess)": p["phase"], "Source": p["hf_source"]})
+                st.dataframe(pd.DataFrame(rows), hide_index=True)
+                st.caption("ΔHf/S° are reference-table values where available, otherwise a transparent "
+                           "bonding-character/phase heuristic — not DFT-grade thermochemistry.")
+
+        with c_viz:
+            st.subheader("Synthesis Pipeline")
+            v1, v2 = st.columns(2)
+
+            reactant_comp = combined_composition(reactants)
+            product_comp = combined_composition(products)
+
+            with v1:
+                st.caption("Reactant State")
+                r_col, r_analysis = bonding_color_for(reactant_comp)
+                r_atom_lines, r_total, r_rendered, _ = build_geometry(reactant_comp)
+                if r_rendered < r_total:
+                    st.caption(f"⚠️ Rendering {r_rendered} of {r_total} atoms.")
+                r_xyz = f"{len(r_atom_lines)}\nReactants\n" + "\n".join(r_atom_lines)
+                r_radius_map = build_radius_map(reactant_comp)
+                r_density_atoms = build_density_atoms(r_atom_lines, reactant_comp)
+                r_html = render_3dmol_html("viewerReact", r_xyz, r_radius_map, r_density_atoms, r_col, iso_val, height=320)
+                st.iframe(r_html, height=320)
+
+            with v2:
+                st.caption("Product State")
+                p_col, p_analysis = bonding_color_for(product_comp)
+                p_atom_lines, p_total, p_rendered, _ = build_geometry(product_comp)
+                if p_rendered < p_total:
+                    st.caption(f"⚠️ Rendering {p_rendered} of {p_total} atoms.")
+                p_xyz = f"{len(p_atom_lines)}\nProducts\n" + "\n".join(p_atom_lines)
+                p_radius_map = build_radius_map(product_comp)
+                p_density_atoms = build_density_atoms(p_atom_lines, product_comp)
+                p_html = render_3dmol_html("viewerProd", p_xyz, p_radius_map, p_density_atoms, p_col, iso_val, height=320)
+                st.iframe(p_html, height=320)
+
+        with c_therm:
+            st.subheader("Energy Profile")
+            delta_h = thermo["delta_h"]
+            # TS hump height is a qualitative heuristic (scales with |ΔH|,
+            # never the actual computed activation barrier), but is now
+            # GUARANTEED to sit above both endpoints regardless of how large
+            # or positive delta_h is, fixing a case the original draft's
+            # simpler 'act_energy = abs(delta_h)*0.3+100' formula could miss
+            # for strongly endothermic reactions (TS could end up BELOW the
+            # product energy, breaking the visual "hump").
+            act_energy_height = max(40.0, abs(delta_h) * 0.25)
+            ts_y = max(0.0, delta_h) + act_energy_height
+            x_vals = [0, 1, 2]
+            y_vals = [0, ts_y, delta_h]
+            curve_color = "#3fb950" if thermo["spontaneous"] else "#ff4b4b"
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=x_vals, y=y_vals, mode="lines+markers", line_shape="spline",
+                line=dict(color=curve_color, width=4), marker=dict(size=8, color=curve_color),
+            ))
+            fig.update_layout(
+                title=f"Reaction Coordinate — {reaction_type.split(' (')[0]}",
+                xaxis=dict(title="Reaction Progress", showticklabels=False, gridcolor="#21262d"),
+                yaxis=dict(title="Free Energy (kJ/mol, relative)", gridcolor="#21262d",
+                           tickfont=dict(color="#e6edf3")),
+                height=380, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#e6edf3"),
+                annotations=[
+                    dict(x=0, y=0, text="Reactants", showarrow=True, arrowhead=1, font=dict(color="#e6edf3")),
+                    dict(x=1, y=ts_y, text="Transition State", showarrow=True, font=dict(color="#e6edf3")),
+                    dict(x=2, y=delta_h, text="Products", showarrow=True, font=dict(color="#e6edf3")),
+                ],
+            )
+            st.plotly_chart(fig, theme=None)
+            st.caption(
+                "Activation-energy hump height is a qualitative heuristic "
+                "(scales with |ΔH|), not a computed transition-state barrier — "
+                "swap for a real NEB/DFT barrier calculation in production."
+            )
+
+st.caption("AtomCraft v4.1 | Universal Nano-Material Property Designer & Reaction Thermodynamics Unit")
