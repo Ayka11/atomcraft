@@ -399,7 +399,14 @@ with st.sidebar:
     st.title("🔬 AtomCraft v4.0")
     st.caption("Universal Nano-Material Property Designer")
     user_input = st.text_input("Chemical Formula", value="AuCl")
-    iso_val = st.slider("Electron Cloud Density", 0.01, 0.50, 0.12)
+    iso_val = st.slider(
+        "Electron Cloud Density", 0.01, 0.50, 0.12,
+        help="Isosurface threshold for a synthetic electron-density cloud "
+             "built from each atom's valence-electron count and radius "
+             "(no real DFT data in heuristic mode). Higher = surface "
+             "contracts toward dense atom cores. Lower = surface expands "
+             "into a larger diffuse cloud."
+    )
     st.info("Universal Prediction Mode — heuristic van Arkel–Ketelaar engine\n\n(element-accurate sphere sizing)")
 
 # ==========================================
@@ -521,7 +528,30 @@ if comp:
         }
         radius_map_json = json.dumps(radius_map)
 
-        surf_scale = max(0.3, 1.6 - (iso_val * 3.0))
+        # BUG FIXED (Electron Cloud Density was a no-op): checked the real
+        # 3Dmol.js source — addSurface's 'scale' option is ONLY consumed
+        # when real volumetric (voldata) data is supplied for CUBE/VASP
+        # parsing; for a plain position-based VDW surface (our previous
+        # approach) it is silently ignored entirely, so the slider was
+        # computing a new value every rerun that nothing downstream ever
+        # read. There's no real DFT density grid available in heuristic
+        # Universal Mode, so we synthesize one: a sum-of-Gaussians electron
+        # density built from each atom's actual valence-electron count and
+        # covalent radius, then feed it through 3Dmol's real isosurface
+        # threshold mechanism (addIsosurface + isoval) — confirmed from
+        # source: voxels with density > isoval are "inside"; raising isoval
+        # genuinely contracts the surface toward atom cores, lowering it
+        # genuinely expands the surface, exactly matching the original spec.
+        # PRODUCTION NOTE: swap this synthetic grid for a real DFT-computed
+        # charge-density cube file in Live API Mode.
+        atoms_for_density = [
+            {"x": x, "y": y, "z": z,
+             "w": float(comp[sym]['valence']),
+             "sigma": max(0.45, comp[sym]['rad'] * 0.55)}
+            for line in atom_lines
+            for sym, x, y, z in [(lambda p: (p[0], float(p[1]), float(p[2]), float(p[3])))(line.split())]
+        ]
+        atoms_for_density_json = json.dumps(atoms_for_density)
 
         html_3d = f"""
         <div id="viewer3d" style="height: 500px; width: 100%; background-color: #0b0e14; border-radius: 10px;"></div>
@@ -544,10 +574,58 @@ if comp:
                     }});
                 }});
 
-                viewer.addSurface($3Dmol.SurfaceType.VDW, {{
-                    opacity: 0.35,
+                // ---- Synthesize a Gaussian-sum electron density grid ----
+                let atoms = {atoms_for_density_json};
+                let pad = 2.5;
+                let xs = atoms.map(a => a.x), ys = atoms.map(a => a.y), zs = atoms.map(a => a.z);
+                let minX = Math.min(...xs) - pad, maxX = Math.max(...xs) + pad;
+                let minY = Math.min(...ys) - pad, maxY = Math.max(...ys) + pad;
+                let minZ = Math.min(...zs) - pad, maxZ = Math.max(...zs) + pad;
+                let N = 28;
+                let dx = (maxX - minX) / (N - 1), dy = (maxY - minY) / (N - 1), dz = (maxZ - minZ) / (N - 1);
+                let data = new Float32Array(N * N * N);
+                let maxRho = 1e-6;
+                for (let ix = 0; ix < N; ix++) {{
+                    let x = minX + ix * dx;
+                    for (let iy = 0; iy < N; iy++) {{
+                        let y = minY + iy * dy;
+                        for (let iz = 0; iz < N; iz++) {{
+                            let z = minZ + iz * dz;
+                            let rho = 0;
+                            for (let k = 0; k < atoms.length; k++) {{
+                                let a = atoms[k];
+                                let ddx = x - a.x, ddy = y - a.y, ddz = z - a.z;
+                                let d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+                                rho += a.w * Math.exp(-d2 / (2 * a.sigma * a.sigma));
+                            }}
+                            data[ix * N * N + iy * N + iz] = rho;
+                            if (rho > maxRho) maxRho = rho;
+                        }}
+                    }}
+                }}
+
+                let voldata = Object.create($3Dmol.VolumeData.prototype);
+                voldata.size = {{ x: N, y: N, z: N }};
+                voldata.unit = {{ x: dx, y: dy, z: dz }};
+                voldata.origin = {{ x: minX, y: minY, z: minZ }};
+                voldata.data = data;
+                voldata.matrix = null;
+
+                // Map the slider (0.01-0.50) onto a FRACTION of this specific
+                // structure's own peak density, rather than an absolute
+                // threshold — guarantees the surface meaningfully contracts
+                // (toward 85% of peak) and expands (down to 5% of peak) across
+                // the full slider range regardless of which elements/how many
+                // atoms are present, instead of depending on fixed constants
+                // happening to land in the right absolute range every time.
+                let frac = ({iso_val} - 0.01) / (0.50 - 0.01);
+                let isoval = maxRho * (0.05 + frac * 0.80);
+
+                viewer.addIsosurface(voldata, {{
+                    isoval: isoval,
                     color: '{b_col}',
-                    scale: {surf_scale}
+                    opacity: 0.45,
+                    smoothness: 1
                 }});
 
                 viewer.zoomTo();
