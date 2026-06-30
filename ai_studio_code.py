@@ -359,6 +359,21 @@ def build_geometry(comp, max_render_atoms=60):
     is_molecule = is_molecule_heuristic(comp)
     atom_lines = []
 
+    # Special-case single-element species (a lone atom like 'Ti', or a
+    # diatomic pair like 'O2'/'N2'/'H2'/'Cl2') with a realistic bond length
+    # instead of falling through to the generic lattice spacing — this
+    # matters most for the Reaction Dashboard, where reactant species are
+    # rendered individually (see build_species_layout) and a believable O2
+    # bond length is what makes the reactant side visually read as "an O2
+    # molecule" rather than two unrelated floating spheres.
+    if len(comp) == 1 and total_atoms <= 2:
+        sym, v = next(iter(comp.items()))
+        if total_atoms == 1:
+            return [f"{sym} 0.00 0.00 0.00"], 1, 1, False
+        bond_len = max(0.74, v['rad'] * 1.6)  # heuristic scaling vs. real diatomic bond lengths
+        return ([f"{sym} {-bond_len/2:.2f} 0.00 0.00", f"{sym} {bond_len/2:.2f} 0.00 0.00"],
+                2, 2, True)
+
     if is_molecule:
         hub_candidates = [s for s, n in counts.items() if n == 1]
 
@@ -441,6 +456,59 @@ def build_density_atoms(atom_lines, comp):
             "sigma": max(0.45, comp[sym]['rad'] * 0.55),
         })
     return atoms
+
+
+def build_species_layout(species_list, spacing=3.0, per_species_cap=16, max_species_shown=6):
+    """Lays out each species in a reactant/product list as its OWN distinct,
+    spatially-separated cluster within one shared scene, instead of merging
+    every species' atom counts into a single blob.
+
+    BUG FIXED: combined_composition() merges all reactant species (and
+    separately all product species) into one atom-count dictionary before
+    rendering. For ANY balanced equation, total atom counts are identical
+    on both sides by definition — that's what 'balanced' means — so a
+    geometry built only from atom counts is mathematically guaranteed to
+    produce the same shape for reactants and products. The actual
+    difference between the two states is bonding TOPOLOGY (e.g. a separate
+    Ti atom + separate O2 molecule vs. one bonded TiO2 structure), which
+    combined_composition discarded entirely. This function renders each
+    species with its own geometry (so O2 looks like a bonded pair, TiO2
+    looks like a bonded triatomic, etc.) and places them side-by-side with
+    visible gaps, so 'before' visibly reads as separate molecules and
+    'after' visibly reads as a different, bonded structure.
+
+    Returns (atom_lines, total_atoms_real, rendered_atom_count, display_comp)
+    where display_comp is a merged {symbol: element_data} dict (counts
+    aside) so build_radius_map/build_density_atoms can look up any element
+    appearing in any of the species, regardless of which species it's in.
+    """
+    shown = species_list[:max_species_shown]
+    truncated_species = len(species_list) > max_species_shown
+
+    atom_lines_all = []
+    display_comp = {}
+    offset_x = 0.0
+    total_atoms_real = 0
+
+    for sp in shown:
+        comp = sp["comp"]
+        for sym, v in comp.items():
+            display_comp.setdefault(sym, v)
+        lines, total, rendered, _ = build_geometry(comp, max_render_atoms=per_species_cap)
+        total_atoms_real += total
+
+        xs = []
+        for line in lines:
+            parts = line.split()
+            sym, x, y, z = parts[0], float(parts[1]), float(parts[2]), float(parts[3])
+            xs.append(x)
+            atom_lines_all.append(f"{sym} {x + offset_x:.2f} {y:.2f} {z:.2f}")
+
+        cluster_width = (max(xs) - min(xs)) if xs else 0.0
+        offset_x += cluster_width + spacing
+
+    return atom_lines_all, total_atoms_real, len(atom_lines_all), display_comp, truncated_species
+
 
 
 def render_3dmol_html(div_id, xyz, radius_map, atoms_for_density, b_col, iso_val, height=520):
@@ -754,6 +822,61 @@ def compute_reaction_thermo(reactants, products, temp_k, pressure_atm):
     }
 
 
+def estimate_ionic_charge_proxy(comp):
+    """Heuristic effective charge magnitude used only for the Born
+    solvation estimate below — NOT a real oxidation-state calculation.
+    Scales with how ionic the bonding character is and the average
+    valence-electron count, clamped to a believable +1..+3 range."""
+    v_list = list(comp.values())
+    total_n = sum(v["n"] for v in v_list)
+    all_chi = [v["chi"] for v in v_list]
+    delta_chi = max(all_chi) - min(all_chi) if len(all_chi) > 1 else 0.0
+    avg_chi = sum(v["chi"] * v["n"] for v in v_list) / total_n
+    avg_valence = sum(v["valence"] * v["n"] for v in v_list) / total_n
+    avg_rad = sum(v["rad"] * v["n"] for v in v_list) / total_n
+    analysis = van_arkel_analysis(avg_chi, delta_chi, symbols=list(comp.keys()))
+    ionic_frac = analysis["ionic_character"] / 100
+    z = max(0.3, min(3.0, ionic_frac * (avg_valence / 2.0)))
+    return z, avg_rad
+
+
+def estimate_solvation_energy(comp, epsilon):
+    """Born solvation free energy (kJ/mol): ΔG_solv = -694 * z²/r * (1 - 1/ε),
+    using the standard Born-model constant (≈694 kJ·mol⁻¹·Å for z in
+    elementary charge, r in Angstrom). A real, named electrostatic effect:
+    a polar medium (high dielectric constant ε, e.g. water ≈ 80)
+    stabilizes charge-separated species far more than a nonpolar one
+    (e.g. vacuum/gas-phase, ε = 1, where the term is exactly zero) — this
+    is the physical basis for why ionic compounds dissociate/ionize so much
+    more readily in water than in an organic solvent. 'z' here is a
+    heuristic charge proxy (see estimate_ionic_charge_proxy), not a real
+    oxidation-state calculation."""
+    z, r = estimate_ionic_charge_proxy(comp)
+    r = max(r, 0.3)
+    return -694.0 * (z ** 2) / r * (1 - 1 / epsilon)
+
+
+def estimate_side_solvation_energy(species_list, epsilon):
+    """Sums solvation energy across each individual species on one side of
+    a reaction (weighted by its coefficient), rather than computing it on
+    combined_composition()'s merged atom-count blob.
+
+    BUG FIXED: calling estimate_solvation_energy directly on a merged blob
+    is wrong for the same root reason build_species_layout was needed for
+    visualization — merging discards which atoms were actually bonded
+    together. For 'Na + Cl2', combined_composition() merges Na and Cl into
+    one dict, and van Arkel analysis on THAT merged dict sees a large
+    electronegativity difference (3.16 - 0.93) and reports high ionic
+    character — even though elemental sodium metal and chlorine gas, sitting
+    side by side, are not actually an ionic compound. Computed per-species
+    instead, Na alone and Cl2 alone each correctly show ~0 ionic character
+    (single-element Δχ = 0), while an actual ionic compound like NaCl
+    appearing as a species on either side still correctly shows strong
+    solvation stabilization in a polar medium."""
+    return sum(sp["coeff"] * estimate_solvation_energy(sp["comp"], epsilon) for sp in species_list)
+
+
+
 def combined_composition(species_list):
     """Sums atom counts across every species on one side of an equation
     (weighted by stoichiometric coefficient) into one composition dict, for
@@ -1041,6 +1164,11 @@ else:
                 f"coefficients exactly as typed."
             )
 
+        # Computed once up front since both Controls (ΔG/solvation) and
+        # Visualization (bonding-color tint) need the per-side composition.
+        reactant_comp = combined_composition(reactants)
+        product_comp = combined_composition(products)
+
         c_ctrl, c_viz, c_therm = st.columns([1, 1.6, 1.2])
 
         with c_ctrl:
@@ -1054,13 +1182,44 @@ else:
                      "(Δn_gas ≠ 0), via ΔG_pressure = Δn_gas · R · T · ln(P) "
                      "— the real ideal-gas free-energy/pressure relationship."
             )
+
+            st.markdown("**Reaction Environment**")
+            epsilon = st.slider(
+                "Solvent Polarity — Dielectric Constant (ε)", 1.0, 80.0, 1.0, step=1.0,
+                help="Models ionization/dissociation via the Born solvation "
+                     "equation: a polar medium stabilizes the more "
+                     "ionic/charge-separated side of the reaction more than "
+                     "the other, shifting ΔG accordingly. Reference points: "
+                     "vacuum/gas-phase ε=1 (no effect, this is the default), "
+                     "hexane ε≈2, ethanol ε≈24, water ε≈80."
+            )
+            catalyst = st.checkbox(
+                "Catalyst Present", value=False,
+                help="A catalyst lowers the activation-energy barrier "
+                     "(reaction coordinate hump) WITHOUT changing ΔH, ΔS, "
+                     "or ΔG — catalysts affect kinetics, not thermodynamics. "
+                     "This only changes the Energy Profile chart, not the "
+                     "ΔG/spontaneity verdict below."
+            )
+
             thermo = compute_reaction_thermo(reactants, products, temp, pressure)
+            solv_react = estimate_side_solvation_energy(reactants, epsilon)
+            solv_prod = estimate_side_solvation_energy(products, epsilon)
+            solv_correction = solv_prod - solv_react
+            delta_g_total = thermo["delta_g"] + solv_correction
+            spontaneous_total = delta_g_total < 0
 
             st.metric("ΔH (reaction)", f"{thermo['delta_h']:.1f} kJ/mol")
             st.metric("ΔS (reaction)", f"{thermo['delta_s_j']:.1f} J/mol·K")
-            st.metric(f"ΔG @ {temp} K, {pressure} atm", f"{thermo['delta_g']:.1f} kJ/mol")
+            st.metric(f"ΔG @ {temp} K, {pressure} atm, ε={epsilon:.0f}", f"{delta_g_total:.1f} kJ/mol")
+            if abs(solv_correction) > 0.5:
+                st.caption(
+                    f"ΔG breakdown: {thermo['delta_g']:.1f} (gas-phase) "
+                    f"{'+' if solv_correction >= 0 else '−'} {abs(solv_correction):.1f} "
+                    f"(solvation/ionization) = {delta_g_total:.1f} kJ/mol"
+                )
 
-            if thermo["spontaneous"]:
+            if spontaneous_total:
                 st.success("✅ Spontaneous (ΔG < 0) at these conditions")
             else:
                 st.error("❌ Non-spontaneous (ΔG > 0) at these conditions")
@@ -1089,36 +1248,48 @@ else:
                                  "Phase (guess)": p["phase"], "Source": p["hf_source"]})
                 st.dataframe(pd.DataFrame(rows), hide_index=True)
                 st.caption("ΔHf/S° are reference-table values where available, otherwise a transparent "
-                           "bonding-character/phase heuristic — not DFT-grade thermochemistry.")
+                           "bonding-character/phase heuristic — not DFT-grade thermochemistry. Solvation "
+                           "uses a heuristic charge proxy, not real oxidation-state analysis.")
 
         with c_viz:
             st.subheader("Synthesis Pipeline")
             v1, v2 = st.columns(2)
 
-            reactant_comp = combined_composition(reactants)
-            product_comp = combined_composition(products)
+            # BUG FIXED: previously both viewports rendered
+            # combined_composition(...) — merging every species on a side
+            # into one atom-count blob. For a balanced equation, reactant
+            # and product atom counts are IDENTICAL by definition, so the
+            # two viewports were mathematically guaranteed to look the
+            # same. Each species is now laid out as its own separated
+            # cluster (see build_species_layout), so 'Ti + O2' visibly
+            # reads as two distinct unbonded species, while 'TiO2' visibly
+            # reads as one bonded structure.
+            r_col, r_analysis = bonding_color_for(reactant_comp)
+            p_col, p_analysis = bonding_color_for(product_comp)
 
             with v1:
-                st.caption("Reactant State")
-                r_col, r_analysis = bonding_color_for(reactant_comp)
-                r_atom_lines, r_total, r_rendered, _ = build_geometry(reactant_comp)
+                st.caption("Reactant State — " + ", ".join(f"{r['coeff']}{r['formula']}" for r in reactants))
+                r_atom_lines, r_total, r_rendered, r_display_comp, r_trunc = build_species_layout(reactants)
                 if r_rendered < r_total:
                     st.caption(f"⚠️ Rendering {r_rendered} of {r_total} atoms.")
+                if r_trunc:
+                    st.caption("⚠️ Showing first 6 species only.")
                 r_xyz = f"{len(r_atom_lines)}\nReactants\n" + "\n".join(r_atom_lines)
-                r_radius_map = build_radius_map(reactant_comp)
-                r_density_atoms = build_density_atoms(r_atom_lines, reactant_comp)
+                r_radius_map = build_radius_map(r_display_comp)
+                r_density_atoms = build_density_atoms(r_atom_lines, r_display_comp)
                 r_html = render_3dmol_html("viewerReact", r_xyz, r_radius_map, r_density_atoms, r_col, iso_val, height=320)
                 st.iframe(r_html, height=320)
 
             with v2:
-                st.caption("Product State")
-                p_col, p_analysis = bonding_color_for(product_comp)
-                p_atom_lines, p_total, p_rendered, _ = build_geometry(product_comp)
+                st.caption("Product State — " + ", ".join(f"{p['coeff']}{p['formula']}" for p in products))
+                p_atom_lines, p_total, p_rendered, p_display_comp, p_trunc = build_species_layout(products)
                 if p_rendered < p_total:
                     st.caption(f"⚠️ Rendering {p_rendered} of {p_total} atoms.")
+                if p_trunc:
+                    st.caption("⚠️ Showing first 6 species only.")
                 p_xyz = f"{len(p_atom_lines)}\nProducts\n" + "\n".join(p_atom_lines)
-                p_radius_map = build_radius_map(product_comp)
-                p_density_atoms = build_density_atoms(p_atom_lines, product_comp)
+                p_radius_map = build_radius_map(p_display_comp)
+                p_density_atoms = build_density_atoms(p_atom_lines, p_display_comp)
                 p_html = render_3dmol_html("viewerProd", p_xyz, p_radius_map, p_density_atoms, p_col, iso_val, height=320)
                 st.iframe(p_html, height=320)
 
@@ -1131,12 +1302,16 @@ else:
             # or positive delta_h is, fixing a case the original draft's
             # simpler 'act_energy = abs(delta_h)*0.3+100' formula could miss
             # for strongly endothermic reactions (TS could end up BELOW the
-            # product energy, breaking the visual "hump").
+            # product energy, breaking the visual "hump"). A present
+            # catalyst lowers this barrier (kinetics only) without touching
+            # delta_h/delta_g, matching real catalyst behavior.
             act_energy_height = max(40.0, abs(delta_h) * 0.25)
+            if catalyst:
+                act_energy_height *= 0.35
             ts_y = max(0.0, delta_h) + act_energy_height
             x_vals = [0, 1, 2]
             y_vals = [0, ts_y, delta_h]
-            curve_color = "#3fb950" if thermo["spontaneous"] else "#ff4b4b"
+            curve_color = "#3fb950" if spontaneous_total else "#ff4b4b"
 
             fig = go.Figure()
             fig.add_trace(go.Scatter(
@@ -1144,9 +1319,16 @@ else:
                 line=dict(color=curve_color, width=4), marker=dict(size=8, color=curve_color),
             ))
             fig.update_layout(
-                title=f"Reaction Coordinate — {reaction_type.split(' (')[0]}",
+                title=f"Reaction Coordinate — {reaction_type.split(' (')[0]}"
+                      + (" (catalyzed)" if catalyst else ""),
                 xaxis=dict(title="Reaction Progress", showticklabels=False, gridcolor="#21262d"),
-                yaxis=dict(title="Free Energy (kJ/mol, relative)", gridcolor="#21262d",
+                # BUG FIXED: axis was labeled "Free Energy" but the curve is
+                # built from delta_h (an enthalpy diagram is also the
+                # conventional choice for textbook reaction-coordinate
+                # plots); ΔG/spontaneity is reported as a single number in
+                # Reaction Controls instead, since it depends on T/P/solvent
+                # in ways not meaningful to plot along a reaction-progress axis.
+                yaxis=dict(title="Enthalpy (kJ/mol, relative to reactants)", gridcolor="#21262d",
                            tickfont=dict(color="#e6edf3")),
                 height=380, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#e6edf3"),
@@ -1159,8 +1341,10 @@ else:
             st.plotly_chart(fig, theme=None)
             st.caption(
                 "Activation-energy hump height is a qualitative heuristic "
-                "(scales with |ΔH|), not a computed transition-state barrier — "
-                "swap for a real NEB/DFT barrier calculation in production."
+                "(scales with |ΔH|, reduced ~65% when a catalyst is present), "
+                "not a computed transition-state barrier — swap for a real "
+                "NEB/DFT barrier calculation in production. Curve color "
+                "reflects overall ΔG-based spontaneity (including solvation)."
             )
 
 st.caption("AtomCraft v4.1 | Universal Nano-Material Property Designer & Reaction Thermodynamics Unit")
