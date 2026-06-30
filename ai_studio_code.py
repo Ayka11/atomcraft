@@ -6,6 +6,9 @@ import re
 import json
 import math
 import functools
+import urllib.request
+import urllib.parse
+import urllib.error
 # (st.iframe replaces components.v1.html below — no extra import needed)
 
 # ==========================================
@@ -234,8 +237,176 @@ def parse_formula(formula):
 
 
 # ==========================================
-# 2 & 3. PREDICTIVE BRIDGE LOGIC (van Arkel–Ketelaar + macro properties)
+# 1.5 LIVE LOOKUP ENGINE (PubChem PUG REST)
 # ==========================================
+# Free, no API key required — the practical "Live API Mode" backend this
+# app's original spec called for, for organic/molecular compounds. Real
+# Materials Project-style inorganic crystal data (band gap, formation
+# energy, density) would need an API key and is a separate, complementary
+# extension point — PubChem's strength is molecular structure/connectivity
+# and basic computed descriptors, not solid-state crystallography.
+#
+# PRODUCTION NOTE — other resources worth adding if more accuracy is
+# needed (not implemented here, scoped out for the reasons below):
+#   - RDKit: a Python LIBRARY, not a hosted API — would need to be added
+#     to requirements.txt and run locally (e.g. for SMILES->3D embedding,
+#     reaction templates, richer descriptors). Real value-add, but it's a
+#     heavier binary dependency that affects Streamlit Cloud build time/
+#     size, so it's left as a clearly-marked future upgrade rather than
+#     silently growing this app's dependency footprint.
+#   - Open Reaction Database (ORD): real experimental reaction
+#     yields/conditions. Genuinely valuable for the Reaction Dashboard's
+#     currently-heuristic activation-energy estimate, but its schema is
+#     protobuf-based and the integration is a meaningfully bigger lift
+#     than this PubChem addition — a good next step, not this one.
+#   - NIST-JANAF / Materials Project: the right source for citation-grade
+#     ΔHf/ΔS thermodynamic data specifically. PubChem does NOT reliably
+#     provide formation enthalpy/entropy, so Live Lookup below upgrades
+#     geometry + identity/descriptors only — the Reaction Dashboard's
+#     ΔH/ΔS engine is intentionally left on the reference-table + bonding
+#     heuristic even when PubChem lookup succeeds.
+PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+
+
+def _pubchem_get(url, timeout=6):
+    """Single HTTP GET, never raises — returns (body_text_or_None, error_str_or_None)."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "AtomCraft/4.1 (Streamlit chemistry app)"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace"), None
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP {e.code}"
+    except urllib.error.URLError as e:
+        return None, f"network error ({e.reason})"
+    except Exception as e:
+        return None, f"unexpected error ({e})"
+
+
+def parse_sdf_atoms(sdf_text):
+    """Minimal MDL V2000 molfile atom-block parser: extracts real
+    (symbol, x, y, z) tuples. Returns None on any malformed/unexpected
+    input rather than raising — bonds are intentionally not parsed, since
+    feeding real coordinates through the existing XYZ-based render
+    pipeline lets 3Dmol re-derive bonds from real interatomic distances,
+    which is both simpler and reuses the app's existing per-element
+    styling/isosurface code unchanged."""
+    try:
+        lines = sdf_text.splitlines()
+        n_atoms = int(lines[3][0:3].strip())
+        if n_atoms <= 0:
+            return None
+        atoms = []
+        for i in range(n_atoms):
+            line = lines[4 + i]
+            x, y, z = float(line[0:10]), float(line[10:20]), float(line[20:30])
+            sym = line[31:34].strip()
+            if sym:
+                atoms.append((sym, x, y, z))
+        return atoms if atoms else None
+    except Exception:
+        return None
+
+
+def pubchem_lookup(formula_or_name, timeout=6):
+    """Looks up a compound on PubChem PUG REST: exact molecular-formula
+    match first, falling back to a name search. ALWAYS returns a dict with
+    'success' set — never raises — so the caller can unconditionally fall
+    back to the heuristic engine on any failure (network error, no match,
+    no conformer available), matching this app's existing fallback-safe
+    architecture (see the original spec's 'graceful heuristic fallback'
+    requirement)."""
+    result = {
+        "success": False, "cid": None, "molecular_formula": None,
+        "molecular_weight": None, "canonical_smiles": None, "iupac_name": None,
+        "xlogp": None, "tpsa": None, "atoms_3d": None, "atoms_2d": None,
+        "source_dimension": None, "error": None,
+    }
+    query = urllib.parse.quote(formula_or_name.strip())
+    if not query:
+        result["error"] = "Empty input."
+        return result
+
+    cid = None
+    last_err = None
+    body, err = _pubchem_get(f"{PUBCHEM_BASE}/compound/fastformula/{query}/cids/JSON", timeout)
+    if err:
+        last_err = err
+    if body:
+        try:
+            cids = json.loads(body)["IdentifierList"]["CID"]
+            if cids:
+                cid = cids[0]
+        except Exception:
+            pass
+    if cid is None:
+        body, err = _pubchem_get(f"{PUBCHEM_BASE}/compound/name/{query}/cids/JSON", timeout)
+        if err:
+            last_err = err
+        if body:
+            try:
+                cids = json.loads(body)["IdentifierList"]["CID"]
+                if cids:
+                    cid = cids[0]
+            except Exception:
+                pass
+    if cid is None:
+        if last_err and "404" not in last_err:
+            result["error"] = f"Could not reach PubChem ({last_err}) — check network/egress settings."
+        else:
+            result["error"] = f"No PubChem match found for '{formula_or_name}'."
+        return result
+    result["cid"] = cid
+
+    props_url = (f"{PUBCHEM_BASE}/compound/cid/{cid}/property/"
+                 "MolecularFormula,MolecularWeight,CanonicalSMILES,IUPACName,XLogP,TPSA/JSON")
+    body, _ = _pubchem_get(props_url, timeout)
+    if body:
+        try:
+            props = json.loads(body)["PropertyTable"]["Properties"][0]
+            result["molecular_formula"] = props.get("MolecularFormula")
+            result["molecular_weight"] = props.get("MolecularWeight")
+            result["canonical_smiles"] = props.get("CanonicalSMILES")
+            result["iupac_name"] = props.get("IUPACName")
+            result["xlogp"] = props.get("XLogP")
+            result["tpsa"] = props.get("TPSA")
+        except Exception:
+            pass
+
+    sdf_text, _ = _pubchem_get(f"{PUBCHEM_BASE}/compound/cid/{cid}/SDF?record_type=3d", timeout)
+    if sdf_text:
+        atoms = parse_sdf_atoms(sdf_text)
+        if atoms:
+            result["atoms_3d"] = atoms
+            result["source_dimension"] = "3D"
+    if result["atoms_3d"] is None:
+        sdf_text, _ = _pubchem_get(f"{PUBCHEM_BASE}/compound/cid/{cid}/SDF?record_type=2d", timeout)
+        if sdf_text:
+            atoms = parse_sdf_atoms(sdf_text)
+            if atoms:
+                result["atoms_2d"] = atoms
+                result["source_dimension"] = "2D"
+
+    result["success"] = True  # CID resolved even if geometry/some properties are missing
+    return result
+
+
+def geom_comp_from_atoms(atoms):
+    """Builds a {symbol: element_data} dict (using THIS app's own
+    periodic-table constants for chi/radius/valence, since PubChem doesn't
+    supply those) from a real (symbol, x, y, z) atom list, so the existing
+    build_radius_map/build_density_atoms pipeline works unchanged on real
+    fetched geometry."""
+    comp = {}
+    for sym, _, _, _ in atoms:
+        if sym not in comp:
+            d = get_el_data(sym)
+            comp[sym] = {"n": 0, "chi": d["chi"], "rad": d["radius"], "col": d["color"],
+                         "group": d["group"], "block": d["block"], "valence": d["valence"]}
+        comp[sym]["n"] += 1
+    return comp
+
+
+
 CATEGORY_COLORS = {
     "Ionic": "#ff4b4b", "Metallic": "#58a6ff",
     "Covalent Network": "#3fb950", "Polar Covalent": "#f0883e",
@@ -1128,6 +1299,18 @@ with st.sidebar:
 
     if mode == "Material Property Inspector":
         user_input = st.text_input("Chemical Formula", value="AuCl")
+        data_source = st.radio(
+            "Data Source", ["Universal Heuristic", "Live Lookup (PubChem)"],
+            help="Universal Heuristic: this app's own periodic-table-driven "
+                 "engine — works for any formula, always available. Live "
+                 "Lookup: fetches the real molecular structure (and MW, "
+                 "SMILES, IUPAC name) from PubChem's free public database "
+                 "for organic/molecular compounds. Bonding-character "
+                 "analysis (χ, band gap, mechanical traits) still comes "
+                 "from the heuristic engine either way — PubChem doesn't "
+                 "supply that. Falls back to Universal Heuristic "
+                 "automatically if the compound isn't found."
+        )
     else:
         eqn_input = st.text_input(
             "Chemical Equation", value="Ti + O2 -> TiO2",
@@ -1174,16 +1357,42 @@ if mode == "Material Property Inspector":
         melt_is_molecule = is_molecule and b_type == "Polar Covalent"
         melt_label, melt_desc = estimate_melting(b_type, melt_is_molecule)
 
+        live_result = None
+        if data_source == "Live Lookup (PubChem)":
+            with st.spinner(f"Looking up '{user_input}' on PubChem..."):
+                live_result = pubchem_lookup(user_input)
+            if not live_result["success"]:
+                st.warning(f"⚠️ Live lookup failed: {live_result['error']} Falling back to Universal Heuristic geometry for visualization.")
+
+        live_atoms = None
+        geom_source_note = None
+        if live_result and live_result["success"]:
+            if live_result["atoms_3d"]:
+                live_atoms = live_result["atoms_3d"]
+                geom_source_note = f"real PubChem 3D conformer, CID {live_result['cid']}"
+            elif live_result["atoms_2d"]:
+                live_atoms = live_result["atoms_2d"]
+                geom_source_note = f"real PubChem 2D structure (no 3D conformer available), CID {live_result['cid']}"
+            elif live_result["cid"]:
+                st.info(f"PubChem matched CID {live_result['cid']} with no downloadable structure — using heuristic geometry, but real properties are shown below.")
+
         c1, c2 = st.columns([2, 1])
 
         with c1:
             st.subheader(f"Molecular Lattice: {user_input}")
-            atom_lines, total_atoms, rendered_n, _ = build_geometry(comp)
-            if rendered_n < total_atoms:
-                st.caption(f"⚠️ Rendering {rendered_n} of {total_atoms} atoms for performance/clarity.")
+            if live_atoms:
+                atom_lines = [f"{sym} {x:.3f} {y:.3f} {z:.3f}" for sym, x, y, z in live_atoms]
+                total_atoms = rendered_n = len(atom_lines)
+                geom_comp = geom_comp_from_atoms(live_atoms)
+                st.caption(f"✅ Using {geom_source_note}.")
+            else:
+                atom_lines, total_atoms, rendered_n, _ = build_geometry(comp)
+                geom_comp = comp
+                if rendered_n < total_atoms:
+                    st.caption(f"⚠️ Rendering {rendered_n} of {total_atoms} atoms for performance/clarity.")
             xyz = f"{len(atom_lines)}\nAtomCraft v4.1\n" + "\n".join(atom_lines)
-            radius_map = build_radius_map(comp)
-            density_atoms = build_density_atoms(atom_lines, comp)
+            radius_map = build_radius_map(geom_comp)
+            density_atoms = build_density_atoms(atom_lines, geom_comp)
             html_3d = render_3dmol_html("viewerMain", xyz, radius_map, density_atoms, b_col, iso_val, height=520)
             st.iframe(html_3d, height=520)
 
@@ -1196,9 +1405,12 @@ if mode == "Material Property Inspector":
             m3.metric("Avg Radius", f"{avg_rad:.2f} Å")
             m4.metric("Bond Type", b_type)
 
-            tab_bond, tab_band, tab_mech, tab_comp = st.tabs(
-                ["Bonding", "Band Structure", "Mechanical", "Composition"]
-            )
+            tab_names = ["Bonding", "Band Structure", "Mechanical", "Composition"]
+            if live_result and live_result["success"]:
+                tab_names.append("Live Data")
+            tabs = st.tabs(tab_names)
+            tab_bond, tab_band, tab_mech, tab_comp = tabs[:4]
+            tab_live = tabs[4] if len(tabs) > 4 else None
 
             with tab_bond:
                 corners = analysis["corners"]
@@ -1286,6 +1498,28 @@ if mode == "Material Property Inspector":
                         "Group": v["group"], "Block": v["block"], "Valence e⁻": v["valence"],
                     })
                 st.dataframe(pd.DataFrame(rows), hide_index=True)
+
+            if tab_live is not None:
+                with tab_live:
+                    lr = live_result
+                    rows = [
+                        {"Property": "PubChem CID", "Value": lr["cid"]},
+                        {"Property": "Molecular Formula", "Value": lr["molecular_formula"]},
+                        {"Property": "Molecular Weight", "Value": f"{lr['molecular_weight']} g/mol" if lr["molecular_weight"] else None},
+                        {"Property": "Canonical SMILES", "Value": lr["canonical_smiles"]},
+                        {"Property": "IUPAC Name", "Value": lr["iupac_name"]},
+                        {"Property": "XLogP", "Value": lr["xlogp"]},
+                        {"Property": "TPSA", "Value": f"{lr['tpsa']} Å²" if lr["tpsa"] else None},
+                        {"Property": "Geometry source", "Value": geom_source_note or "none available (heuristic used)"},
+                    ]
+                    st.dataframe(pd.DataFrame(rows), hide_index=True)
+                    if lr["cid"]:
+                        st.caption(f"[View full PubChem record →](https://pubchem.ncbi.nlm.nih.gov/compound/{lr['cid']})")
+                    st.caption(
+                        "Real structure/identity data from PubChem PUG REST (free, no API key). "
+                        "Bonding-character analysis (χ, band gap, mechanical traits) above still "
+                        "comes from this app's own heuristic engine — PubChem doesn't supply that."
+                    )
     else:
         st.error("Invalid Formula")
 
