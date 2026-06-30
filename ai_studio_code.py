@@ -345,16 +345,41 @@ def is_molecule_heuristic(comp):
 # ==========================================
 # 3.5 GEOMETRY + 3D RENDERING (shared by both modes)
 # ==========================================
-def build_geometry(comp, max_render_atoms=60):
+def build_geometry(comp, max_render_atoms=60, epsilon=1.0):
     """Returns (atom_lines, total_atoms, rendered_atom_count, is_molecule).
     Two heuristic templates: a hub-and-ligand layout for small discrete
     molecules (bent/trigonal/spherical-spread depending on ligand count),
     and an interleaved cubic lattice — SIZED TO THE REAL ATOM COUNT, not a
-    fixed 8 corners — for extended ionic/network/metallic structures."""
+    fixed 8 corners — for extended ionic/network/metallic structures.
+
+    BUG FIXED (epsilon had no visual effect): the Solvent Polarity slider
+    only changed a numeric ΔG correction — nothing in the 3D scene
+    responded to it at all. Bond lengths and lattice spacing are now
+    scaled by a 'dissociation stretch' factor that grows with this
+    compound's OWN ionic character (computed via the same van Arkel
+    analysis used for bonding classification) and with how far epsilon is
+    above 1 (vacuum/gas-phase, where the factor is exactly 1.0 — i.e. no
+    visual change at the default slider position, matching the existing
+    ΔG correction's zero-at-vacuum behavior). This directly visualizes
+    ionization/solvation: a polar medium genuinely pulls an ionic lattice's
+    atoms apart (real dissociation into separated, solvated ions), while a
+    covalent network or metal — which doesn't ionize the same way — stays
+    essentially unchanged regardless of solvent polarity."""
     counts = {sym: v['n'] for sym, v in comp.items()}
     total_atoms = sum(counts.values())
     if total_atoms == 0:
         return [], 0, 0, False
+
+    if len(comp) >= 2:
+        v_list = list(comp.values())
+        total_n = sum(v['n'] for v in v_list)
+        all_chi = [v['chi'] for v in v_list]
+        delta_chi = max(all_chi) - min(all_chi)
+        avg_chi = sum(v['chi'] * v['n'] for v in v_list) / total_n
+        ionic_frac = van_arkel_analysis(avg_chi, delta_chi, symbols=list(comp.keys()))["ionic_character"] / 100
+    else:
+        ionic_frac = 0.0
+    stretch = 1.0 + ionic_frac * min(1.5, max(0.0, epsilon - 1.0) / 30.0)
 
     is_molecule = is_molecule_heuristic(comp)
     atom_lines = []
@@ -383,7 +408,7 @@ def build_geometry(comp, max_render_atoms=60):
         expanded = [s for s, n in counts.items() for _ in range(n)]
         others = expanded.copy()
         others.remove(hub)
-        bond_len = 1.1
+        bond_len = 1.1 * stretch
 
         atom_lines.append(f"{hub} 0.00 0.00 0.00")
         n_others = len(others)
@@ -414,7 +439,7 @@ def build_geometry(comp, max_render_atoms=60):
         render_n = min(total_atoms, max_render_atoms)
         interleaved = interleaved[:render_n]
 
-        spacing = 2.5
+        spacing = 2.5 * stretch
         dim = max(2, int(np.ceil(render_n ** (1 / 3))))
         grid_positions = []
         for x in range(dim):
@@ -458,7 +483,7 @@ def build_density_atoms(atom_lines, comp):
     return atoms
 
 
-def build_species_layout(species_list, spacing=3.0, per_species_cap=16, max_species_shown=6):
+def build_species_layout(species_list, spacing=3.0, per_species_cap=16, max_species_shown=6, epsilon=1.0):
     """Lays out each species in a reactant/product list as its OWN distinct,
     spatially-separated cluster within one shared scene, instead of merging
     every species' atom counts into a single blob.
@@ -494,7 +519,7 @@ def build_species_layout(species_list, spacing=3.0, per_species_cap=16, max_spec
         comp = sp["comp"]
         for sym, v in comp.items():
             display_comp.setdefault(sym, v)
-        lines, total, rendered, _ = build_geometry(comp, max_render_atoms=per_species_cap)
+        lines, total, rendered, _ = build_geometry(comp, max_render_atoms=per_species_cap, epsilon=epsilon)
         total_atoms_real += total
 
         xs = []
@@ -701,15 +726,25 @@ def guess_phase(comp, is_molecule):
     return "gas" if (nonmetal_only and is_molecule) else "solid"
 
 
-def estimate_standard_entropy(comp, is_molecule):
-    """Rough S° (J/mol·K) by phase guess, scaled gently by atom count
-    (more atoms -> more vibrational/rotational modes -> more entropy).
-    Calibrated loosely against real S° ranges: gases ~130-260,
-    solid elements ~25-35, solid compounds ~40-160."""
-    phase = guess_phase(comp, is_molecule)
+def estimate_standard_entropy(comp, is_molecule, explicit_phase=None):
+    """Rough S° (J/mol·K) by phase, scaled gently by atom count (more atoms
+    -> more vibrational/rotational modes -> more entropy). Calibrated
+    loosely against real S° ranges: gases ~130-260, liquids ~50-120,
+    aqueous species ~80-200 (solvent ordering lowers it vs. pure gas),
+    solid elements ~25-35, solid compounds ~40-160.
+
+    If explicit_phase is given (from a state symbol the user typed, e.g.
+    'NaCl(s)'), it OVERRIDES the heuristic guess_phase() — trusting what
+    the user explicitly stated is more reliable than guessing from
+    composition alone."""
+    phase = explicit_phase or guess_phase(comp, is_molecule)
     total_atoms = sum(v['n'] for v in comp.values())
     if phase == "gas":
         s = min(260.0, 130 + 12 * total_atoms)
+    elif phase == "liquid":
+        s = min(120.0, 50 + 7 * total_atoms)
+    elif phase == "aqueous":
+        s = min(200.0, 80 + 10 * total_atoms)
     else:
         s = 30.0 if len(comp) == 1 else min(160.0, 40 + 9 * total_atoms)
     return s, phase
@@ -718,20 +753,46 @@ def estimate_standard_entropy(comp, is_molecule):
 R_KJ = 0.0083145  # kJ/(mol*K)
 
 
+_STATE_SYMBOL_RE = re.compile(r'\(\s*(s|g|l|aq)\s*\)\s*$', re.IGNORECASE)
+_PHASE_FROM_TAG = {"s": "solid", "g": "gas", "l": "liquid", "aq": "aqueous"}
+_TRAILING_CHARGE_RE = re.compile(r'(\^?\d*[+\-])\s*$')
+
+
 def parse_equation(eqn):
     """Splits 'aA + bB -> cC + dD' into coefficient/formula pairs on each
     side. Coefficient parsing is regex-anchored on leading digits only
     (unlike a naive '[A-Za-z0-9]*' formula match), so it stays correct for
-    formulas containing parentheses/hydrates, e.g. '3Ca(OH)2 -> ...'."""
+    formulas containing parentheses/hydrates, e.g. '3Ca(OH)2 -> ...'.
+
+    Supports: plain '->', '=', and equilibrium arrows ('⇌', '↔', '<=>',
+    '<->') as synonyms — direction is always evaluated left-to-right as
+    written. Also strips trailing state symbols (s)/(g)/(l)/(aq) and uses
+    them as an authoritative phase override for the entropy/Δn_gas
+    calculation (overriding the heuristic guess_phase), since an explicit
+    user-provided phase is more reliable than a guess.
+
+    NOT supported: explicit ionic charge notation (e.g. 'Na+', 'Cl-',
+    'SO4^2-'). The '+' used for a charge is structurally indistinguishable
+    from the '+' used to separate species in this grammar (e.g. 'Na+ + Cl-'
+    — is that second '+' a charge or a separator?), so charged species are
+    flagged with a warning rather than silently mis-parsed."""
     eqn = eqn.strip()
-    eqn = eqn.replace("\u2192", "->")
+    # BUG FIXED: equilibrium-arrow variants must be normalized BEFORE the
+    # bare '=' fallback runs, otherwise '<=>' gets corrupted (the naive
+    # single '=' replace turned 'N2 + 3H2 <=> 2NH3' into the nonsense
+    # 'N2 + 3H2 <-> 2NH3' split as '<' / '> 2NH3', silently producing wrong
+    # species rather than failing loudly).
+    for arrow in ("\u21cc", "\u2194", "<=>", "<->", "\u2192"):
+        eqn = eqn.replace(arrow, "->")
     if "->" not in eqn and "=" in eqn:
         eqn = eqn.replace("=", "->", 1)
     if "->" not in eqn:
-        return None, None, "Equation must contain '->' separating reactants and products."
+        return None, None, "Equation must contain '->' (or '=', '⇌', '<=>') separating reactants and products."
     parts = eqn.split("->")
     if len(parts) != 2:
-        return None, None, "Equation must contain exactly one '->'."
+        return None, None, "Equation must contain exactly one reactants/products separator."
+
+    charge_warning = [False]
 
     def process_side(raw):
         species = []
@@ -739,6 +800,18 @@ def parse_equation(eqn):
             item = item.strip()
             if not item:
                 continue
+
+            state_match = _STATE_SYMBOL_RE.search(item)
+            explicit_phase = None
+            if state_match:
+                explicit_phase = _PHASE_FROM_TAG[state_match.group(1).lower()]
+                item = item[:state_match.start()].strip()
+            if not item:
+                continue
+
+            if _TRAILING_CHARGE_RE.search(item):
+                charge_warning[0] = True
+
             m = re.match(r'^(\d*)\s*(.*)$', item)
             coeff = int(m.group(1)) if m.group(1) else 1
             formula_str = m.group(2).strip()
@@ -747,13 +820,23 @@ def parse_equation(eqn):
             comp = parse_formula(formula_str)
             if not comp:
                 continue
-            species.append({"coeff": coeff, "formula": formula_str, "comp": comp})
+            species.append({
+                "coeff": coeff, "formula": formula_str, "comp": comp,
+                "explicit_phase": explicit_phase,
+            })
         return species
 
     reactants = process_side(parts[0])
     products = process_side(parts[1])
     if not reactants or not products:
         return None, None, "Could not parse one or both sides of the equation."
+    if charge_warning[0]:
+        return reactants, products, (
+            "⚠️ Ionic charge notation (e.g. 'Na+', 'Cl-') is not supported — the "
+            "'+'/'-' characters collide with this parser's species-separator and "
+            "coefficient grammar, so charges may be parsed incorrectly. Results "
+            "below may be unreliable; consider writing neutral formula units instead."
+        )
     return reactants, products, None
 
 
@@ -792,7 +875,8 @@ def compute_reaction_thermo(reactants, products, temp_k, pressure_atm):
 
     for r in reactants:
         hf, src = estimate_formation_enthalpy(r["comp"])
-        s, phase = estimate_standard_entropy(r["comp"], is_molecule_heuristic(r["comp"]))
+        s, phase = estimate_standard_entropy(r["comp"], is_molecule_heuristic(r["comp"]),
+                                              explicit_phase=r.get("explicit_phase"))
         r["hf"], r["hf_source"], r["s"], r["phase"] = hf, src, s, phase
         h_react += r["coeff"] * hf
         s_react += r["coeff"] * s
@@ -801,7 +885,8 @@ def compute_reaction_thermo(reactants, products, temp_k, pressure_atm):
 
     for p in products:
         hf, src = estimate_formation_enthalpy(p["comp"])
-        s, phase = estimate_standard_entropy(p["comp"], is_molecule_heuristic(p["comp"]))
+        s, phase = estimate_standard_entropy(p["comp"], is_molecule_heuristic(p["comp"]),
+                                              explicit_phase=p.get("explicit_phase"))
         p["hf"], p["hf_source"], p["s"], p["phase"] = hf, src, s, phase
         h_prod += p["coeff"] * hf
         s_prod += p["coeff"] * s
@@ -1153,9 +1238,11 @@ if mode == "Material Property Inspector":
 else:
     reactants, products, err = parse_equation(eqn_input)
 
-    if err:
+    if reactants is None:
         st.error(f"{err} Use the format: '2H2 + O2 -> 2H2O'")
     else:
+        if err:
+            st.warning(err)
         rc, pc, balanced = check_atom_balance(reactants, products)
         if not balanced:
             st.warning(
@@ -1269,7 +1356,7 @@ else:
 
             with v1:
                 st.caption("Reactant State — " + ", ".join(f"{r['coeff']}{r['formula']}" for r in reactants))
-                r_atom_lines, r_total, r_rendered, r_display_comp, r_trunc = build_species_layout(reactants)
+                r_atom_lines, r_total, r_rendered, r_display_comp, r_trunc = build_species_layout(reactants, epsilon=epsilon)
                 if r_rendered < r_total:
                     st.caption(f"⚠️ Rendering {r_rendered} of {r_total} atoms.")
                 if r_trunc:
@@ -1282,7 +1369,7 @@ else:
 
             with v2:
                 st.caption("Product State — " + ", ".join(f"{p['coeff']}{p['formula']}" for p in products))
-                p_atom_lines, p_total, p_rendered, p_display_comp, p_trunc = build_species_layout(products)
+                p_atom_lines, p_total, p_rendered, p_display_comp, p_trunc = build_species_layout(products, epsilon=epsilon)
                 if p_rendered < p_total:
                     st.caption(f"⚠️ Rendering {p_rendered} of {p_total} atoms.")
                 if p_trunc:
